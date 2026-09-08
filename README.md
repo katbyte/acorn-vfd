@@ -56,7 +56,13 @@ unsupported, and use `dump` plus `raw` to probe at your own risk.
 
 ## Install
 
-Binaries for macOS, Linux and Windows are on the releases page. From source (Go 1.27+; macOS needs the
+Homebrew (macOS and Linux):
+
+```
+brew install katbyte/tap/acornvfd
+```
+
+Binaries for macOS, Linux and Windows are also on the releases page. From source (Go 1.27+; macOS needs the
 Xcode command line tools because CoreBluetooth is reached through cgo):
 
 ```
