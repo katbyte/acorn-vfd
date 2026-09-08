@@ -6,6 +6,7 @@
 ![build](https://github.com/katbyte/acorn-vfd/actions/workflows/build.yaml/badge.svg)
 ![test](https://github.com/katbyte/acorn-vfd/actions/workflows/pr-tests.yaml/badge.svg)
 ![lint](https://github.com/katbyte/acorn-vfd/actions/workflows/pr-golangci-lint.yaml/badge.svg)
+![CodeQL](https://github.com/katbyte/acorn-vfd/actions/workflows/codeql-analysis.yml/badge.svg)
 
 **Control the 橡果工坊 (Acorn Workshop) IV48 / 1V48 round-dial VFD fluorescent clock over Bluetooth from the
 command line, on macOS, Linux, or Windows, without the WeChat mini-program.**
