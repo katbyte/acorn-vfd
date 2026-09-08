@@ -3,7 +3,8 @@ extends: default
 
 ignore:
   - vendor/
-  - .tools/venv/
+  - integration/testdata/
+  - .tools/venv/ # repo-local yamllint venv (gitignored) must not be linted
 
 rules:
   comments:

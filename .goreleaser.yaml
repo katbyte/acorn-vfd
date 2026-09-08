@@ -3,7 +3,10 @@ version: 2
 project_name: acornvfd
 
 builds:
-  # linux (BlueZ over D-Bus) and windows (WinRT) are pure Go and cross-compile from anywhere
+  # Mirrors katbyte/tctest's target matrix. Deviations, each forced by tinygo.org/x/bluetooth or Go itself:
+  #   - freebsd/openbsd/solaris dropped: the BLE library has no backend for them (package fails to compile)
+  #   - darwin moved to its own cgo build below: CoreBluetooth is reached through cgo
+  # Everything else (linux 386/amd64/arm/arm64/riscv64, windows 386/amd64/arm64) is verified to cross-compile.
   - id: nocgo
     env:
       - CGO_ENABLED=0
@@ -15,14 +18,25 @@ builds:
       - linux
       - windows
     goarch:
+      - '386'
       - amd64
+      - arm
       - arm64
+      - riscv64
+    goarm:
+      - '6'
+      - '7'
+    ignore:
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: riscv64
     ldflags:
       - -s -w
       - -X github.com/katbyte/acornvfd/lib/version.Version={{ .Tag }}
       - -X github.com/katbyte/acornvfd/lib/version.GitCommit={{ .ShortCommit }}
 
-  # darwin needs cgo for CoreBluetooth, so this build only works when goreleaser runs on macOS
+  # darwin needs cgo for CoreBluetooth, so this build only works when goreleaser runs on macOS (release.yaml does)
   - id: darwin
     env:
       - CGO_ENABLED=1

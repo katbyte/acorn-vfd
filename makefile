@@ -1,10 +1,9 @@
 # recipes use bash for pipefail support (ubuntu's default sh is dash)
 SHELL := /bin/bash
 
-GIT_COMMIT=$(shell git describe --always --long --dirty 2>/dev/null || echo none)
+GIT_COMMIT=$(shell git describe --always --long --dirty)
 GIT_VERSION=$(shell git describe --tags --dirty 2>/dev/null | sed 's/-\([0-9]*\)-g/+\1@g/' || echo dev)
-TEST_TIMEOUT?=5m
-LDFLAGS=-X github.com/katbyte/acornvfd/lib/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/acornvfd/lib/version.Version=${GIT_VERSION}
+TEST_TIMEOUT?=15m
 
 # dev tool binaries are built into .tools/bin (gitignored) from the versions pinned in
 # .tools/go.mod - the single source of truth for make and CI; dependabot keeps them updated
@@ -12,10 +11,6 @@ TOOLS_BIN=.tools/bin
 ACTIONLINT=$(TOOLS_BIN)/actionlint
 GOFUMPT=$(TOOLS_BIN)/gofumpt
 GOLANGCI_LINT=$(TOOLS_BIN)/golangci-lint
-
-# golangci-lint with the azproviderlint module plugin compiled in (.tools/.custom-gcl.yml); lint runs use this
-# binary, the plain go.mod one exists to bootstrap `golangci-lint custom`
-GOLANGCI_LINT_MODULES=$(TOOLS_BIN)/golangci-with-modules
 
 # non-Go tools also live in .tools/bin at pinned versions, but the pins are here (dependabot
 # cannot bump them): shellcheck is a static haskell binary downloaded from its github release,
@@ -25,13 +20,17 @@ YAMLLINT_VERSION=1.38.0
 SHELLCHECK=$(TOOLS_BIN)/shellcheck
 YAMLLINT=$(TOOLS_BIN)/yamllint
 
+# golangci-lint with the azproviderlint module plugin compiled in (.tools/.custom-gcl.yml);
+# lint runs use this binary, the plain go.mod one exists to bootstrap `golangci-lint custom`
+GOLANGCI_LINT_MODULES=$(TOOLS_BIN)/golangci-with-modules
+
 # one rule builds any Go tool: the import path comes from the tool directives in .tools/go.mod
 # (via go list tool), so the makefile never repeats it - add a tool there and a variable above
 $(TOOLS_BIN)/%: .tools/go.mod .tools/go.sum
 	@echo "==> building $* (version pinned in .tools/go.mod)..."
 	@cd .tools && go build -o bin/$* $$(go list tool | grep "/$*$$")
 
-# explicit rule takes precedence over the pattern rule above
+# explicit rules take precedence over the pattern rule above for the non-Go tools
 $(GOLANGCI_LINT_MODULES): .tools/.custom-gcl.yml $(GOLANGCI_LINT)
 	@echo "==> building golangci-lint with plugins (versions pinned in .tools/.custom-gcl.yml)..."
 	@cd .tools && bin/golangci-lint custom
@@ -57,13 +56,13 @@ help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make \033[36m<target>\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-24s\033[0m%s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 
 ##@ Build
-build: ## Compile acornvfd with version info from git (needs cgo on macOS for CoreBluetooth)
+build: ## Compile acornvfd with version info from git
 	@echo "==> building..."
-	go build -ldflags "$(LDFLAGS)"
+	go build -ldflags "-X github.com/katbyte/acornvfd/lib/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/acornvfd/lib/version.Version=${GIT_VERSION}"
 
 install: ## Install acornvfd into GOPATH/bin with version info from git
 	@echo "==> installing..."
-	go install -ldflags "$(LDFLAGS)" .
+	go install -ldflags "-X github.com/katbyte/acornvfd/lib/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/acornvfd/lib/version.Version=${GIT_VERSION}" .
 
 tools: $(ACTIONLINT) $(GOFUMPT) $(GOLANGCI_LINT) $(GOLANGCI_LINT_MODULES) $(SHELLCHECK) $(YAMLLINT) ## Install all pinned dev tools into .tools/bin
 
@@ -99,7 +98,7 @@ yamllint: $(YAMLLINT) ## Check YAML files with yamllint (config in .yamllint.yml
 
 shellcheck: $(SHELLCHECK) ## Check shell scripts with shellcheck
 	@echo "==> Checking shell scripts with shellcheck..."
-	@$(SHELLCHECK) scripts/*.sh
+	@$(SHELLCHECK) scripts/*.sh # tctest also checks .github/images/*.sh; this repo has no scripts there
 
 depscheck: ## Check that go.mod/go.sum and vendor/ are in sync
 	@echo "==> Checking source code with go mod tidy..."
@@ -121,7 +120,7 @@ depscheck: ## Check that go.mod/go.sum and vendor/ are in sync
 		(echo; echo "golangci-lint version mismatch: .tools/go.mod has $$modv but .tools/.custom-gcl.yml has $$gclv - update .custom-gcl.yml to match."; exit 1)
 
 ##@ Testing
-test: build ## Run unit tests under the race detector (no Bluetooth hardware needed)
+test: build ## Run unit tests under the race detector (tctest also runs integration/; this repo has none)
 	go test -race ./... -timeout ${TEST_TIMEOUT}
 
 check-all: build test lint actionlint yamllint shellcheck depscheck ## Run build + test + all linters + depscheck

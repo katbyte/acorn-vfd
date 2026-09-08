@@ -463,37 +463,40 @@ func Dump(opts Options, w io.Writer) error {
 		return fmt.Errorf("discovering services: %w", err)
 	}
 
-	fmt.Fprintf(w, "device %s (%s)\n", found.Name, found.Address)
-	fmt.Fprintf(w, "advertised services: %v\n", found.Result.ServiceUUIDs())
+	// console output: a failed write to w is not actionable here, so the error is deliberately dropped once
+	out := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+
+	out("device %s (%s)\n", found.Name, found.Address)
+	out("advertised services: %v\n", found.Result.ServiceUUIDs())
 	if md := found.Result.ManufacturerData(); len(md) > 0 {
 		for _, m := range md {
-			fmt.Fprintf(w, "manufacturer data: company 0x%04X data % X\n", m.CompanyID, m.Data)
+			out("manufacturer data: company 0x%04X data % X\n", m.CompanyID, m.Data)
 		}
 	}
-	fmt.Fprintf(w, "%d services\n", len(services))
+	out("%d services\n", len(services))
 
 	buf := make([]byte, 512)
 	for _, svc := range services {
-		fmt.Fprintf(w, "- service %s%s\n", svc.UUID(), annotateService(svc.UUID()))
+		out("- service %s%s\n", svc.UUID(), annotateService(svc.UUID()))
 
 		chars, err := svc.DiscoverCharacteristics(nil)
 		if err != nil {
-			fmt.Fprintf(w, "  ! characteristic discovery failed: %v\n", err)
+			out("  ! characteristic discovery failed: %v\n", err)
 			continue
 		}
 		for _, ch := range chars {
-			fmt.Fprintf(w, "  - characteristic %s%s\n", ch.UUID(), annotateChar(ch.UUID()))
+			out("  - characteristic %s%s\n", ch.UUID(), annotateChar(ch.UUID()))
 			if mtu, err := ch.GetMTU(); err == nil {
-				fmt.Fprintf(w, "      mtu %d\n", mtu)
+				out("      mtu %d\n", mtu)
 			}
 			n, err := ch.Read(buf)
 			switch {
 			case err != nil:
-				fmt.Fprintf(w, "      read: %v\n", err)
+				out("      read: %v\n", err)
 			case n == 0:
-				fmt.Fprint(w, "      read: (empty)\n")
+				out("      read: (empty)\n")
 			default:
-				fmt.Fprintf(w, "      read: % X  %q\n", buf[:n], printable(buf[:n]))
+				out("      read: % X  %q\n", buf[:n], printable(buf[:n]))
 			}
 		}
 	}
