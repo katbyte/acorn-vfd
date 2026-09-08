@@ -1,4 +1,4 @@
-## Unreleased
+## v0.1.3 (2026-09-08)
 
 - Fix a data race in scanning: results are now handed to the calling goroutine instead of being touched from the Bluetooth library's callback (which on macOS can still fire after the scan stops).
 - `scan` lists a device again when its name turns up in a later packet than its address, instead of showing it as `(no name)` forever; `time` and friends find an intermittently-named clock the same way.
