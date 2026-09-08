@@ -104,7 +104,7 @@ UUID that is stable for this Mac but differs from the device's MAC.`,
 			cout.Printf("scanning for <yellow>%s</>...\n", f.Device.ScanTimeout)
 
 			n := 0
-			err = ble.Scan(f.Device.ScanTimeout, all, func(d ble.Found) bool {
+			if err := ble.Scan(f.Device.ScanTimeout, all, func(d ble.Found) bool {
 				n++
 				name := d.Name
 				if name == "" {
@@ -114,8 +114,7 @@ UUID that is stable for this Mac but differs from the device's MAC.`,
 				}
 				cout.Quietf("<cyan>%s</>  rssi <yellow>%4d</>  %s\n", d.Address, d.RSSI, name)
 				return false
-			})
-			if err != nil {
+			}); err != nil {
 				return err
 			}
 
@@ -187,10 +186,9 @@ specific command is caught in the same connection.`,
 			}
 			defer func() { _ = conn.Close() }()
 
-			err = conn.Listen(func(b []byte) {
+			if err := conn.Listen(func(b []byte) {
 				cout.Quietf("<gray>%s</> <cyan>% X</>  %q\n", time.Now().Format("15:04:05.000"), b, printable(b))
-			})
-			if err != nil {
+			}); err != nil {
 				return err
 			}
 

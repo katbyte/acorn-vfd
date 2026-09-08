@@ -11,8 +11,7 @@ func TestChecksum(t *testing.T) {
 	t.Parallel()
 
 	// worked example from PROTOCOL.md: set time 15:23:00
-	body := []byte{0xFF, 0x01, 0x01, 0x0F, 0x17, 0x00, 0x00}
-	if got := xggf.Checksum(body); got != 0xD9 {
+	if got := xggf.Checksum([]byte{0xFF, 0x01, 0x01, 0x0F, 0x17, 0x00, 0x00}); got != 0xD9 {
 		t.Fatalf("Checksum = %02X, want D9", got)
 	}
 

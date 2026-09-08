@@ -168,14 +168,13 @@ func Find(opts Options) (Found, error) {
 			window = remaining
 		}
 
-		err := Scan(window, true, func(f Found) bool {
+		if err := Scan(window, true, func(f Found) bool {
 			if !matches(opts, f) {
 				return false
 			}
 			match, matched = f, true
 			return true
-		})
-		if err != nil {
+		}); err != nil {
 			return Found{}, err
 		}
 	}
