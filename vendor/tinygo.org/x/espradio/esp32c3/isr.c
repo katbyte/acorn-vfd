@@ -1,0 +1,185 @@
+//go:build esp32c3
+
+#include <stdint.h>
+#include "espradio.h"
+#include "soc/interrupts.h"
+
+/* ---- Interrupt controller registers (ESP32-C3) ---- */
+
+#define ESPRADIO_INTC_BASE            0x600C2000u
+#define ESPRADIO_INTC_ENABLE_REG      (*(volatile uint32_t *)(ESPRADIO_INTC_BASE + 0x104u))
+#define ESPRADIO_INTC_TYPE_REG        (*(volatile uint32_t *)(ESPRADIO_INTC_BASE + 0x108u))
+#define ESPRADIO_INTC_CLEAR_REG       (*(volatile uint32_t *)(ESPRADIO_INTC_BASE + 0x10Cu))
+#define ESPRADIO_INTC_PRI_REG(n)      (*(volatile uint32_t *)(ESPRADIO_INTC_BASE + 0x114u + (uint32_t)(n) * 4u))
+
+/* Interrupt matrix base: each 32-bit register at offset 4*source routes that
+ * peripheral source to a CPU interrupt number (0 = disabled, 1-31 = active). */
+#define ESPRADIO_INTMTX_BASE          0x600C2000u
+#define ESPRADIO_INTMTX_MAP(source)   (*(volatile uint32_t *)(ESPRADIO_INTMTX_BASE + (uint32_t)(source) * 4u))
+
+/* The CPU interrupt number used for all WiFi peripheral sources.
+ * TinyGo registers its handler on this interrupt via interrupt.New(). */
+#define ESPRADIO_WIFI_CPU_INT  1u
+
+/* TinyGo routes ETS_GPIO_INTR_SOURCE (16) to this CPU interrupt (cpuInterruptFromPin
+ * in machine_esp32c3.go).  Restored after every schedOnce() so that blob ROM
+ * calls (e.g. direct intr_matrix_set) cannot permanently steal the GPIO source. */
+#define ESPRADIO_GPIO_CPU_INT  6u
+
+/* Pre-wire WiFi peripheral interrupt sources to the WiFi CPU interrupt.
+ * Must be called before esp_wifi_init so routing is in place before the
+ * blob enables the peripheral-side interrupts.
+ * Matches the approach in esp-wifi (Rust): routing is done once during
+ * our controlled init, and the blob's set_intr calls are no-ops. */
+void espradio_prewire_wifi_interrupts(void) {
+    intr_matrix_set(0, ETS_WIFI_MAC_INTR_SOURCE, ESPRADIO_WIFI_CPU_INT);
+    intr_matrix_set(0, ETS_WIFI_PWR_INTR_SOURCE, ESPRADIO_WIFI_CPU_INT);
+}
+
+extern void espradio_mark_wifi_isr_slot(int32_t n);
+
+/* No-op: the blob calls set_intr to route peripheral sources to CPU
+ * interrupts, but on RISC-V (ESP32-C3) the routing is already configured
+ * by espradio_prewire_wifi_interrupts(). Letting the blob call
+ * intr_matrix_set at arbitrary times interferes with TinyGo's interrupt
+ * controller state.  The Rust esp-wifi does the same (no-op set_intr).
+ * Record the blob's requested intr_num as a WiFi ISR slot. */
+void espradio_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num, int32_t intr_prio) {
+    (void)cpu_no;
+    (void)intr_source;
+    (void)intr_prio;
+    espradio_mark_wifi_isr_slot((int32_t)intr_num);
+}
+
+/* No-op: the Rust esp-wifi also no-ops clear_intr. */
+void espradio_clear_intr(uint32_t intr_source, uint32_t intr_num) {
+    (void)intr_source;
+    (void)intr_num;
+}
+
+/* Enable/disable CPU interrupts by directly manipulating the
+ * CPU_INT_ENABLE register instead of calling ROM functions
+ * (ets_isr_unmask / ets_isr_mask) which may have side effects
+ * that conflict with TinyGo's interrupt controller setup. */
+void espradio_ints_on(uint32_t mask) {
+    ESPRADIO_INTC_ENABLE_REG |= mask;
+}
+
+void espradio_ints_off(uint32_t mask) {
+    ESPRADIO_INTC_ENABLE_REG &= ~mask;
+}
+
+/* Switch CPU interrupt 1 from edge to level type.
+ * Must be called AFTER esp_wifi_init() so the blob's ISR handlers are
+ * registered and can acknowledge the peripheral when a level interrupt
+ * fires.  Without a handler to service the peripheral, a level-asserted
+ * line would cause infinite re-entry.
+ *
+ * Sequence: disable → clear latched edge → switch to level → fence → re-enable.
+ */
+void espradio_wifi_int_to_level(void) {
+    ESPRADIO_INTC_ENABLE_REG &= ~(1u << ESPRADIO_WIFI_CPU_INT);
+    ESPRADIO_INTC_CLEAR_REG  |=  (1u << ESPRADIO_WIFI_CPU_INT);
+    ESPRADIO_INTC_CLEAR_REG  &= ~(1u << ESPRADIO_WIFI_CPU_INT);
+    ESPRADIO_INTC_TYPE_REG   &= ~(1u << ESPRADIO_WIFI_CPU_INT);
+    __asm__ volatile ("fence" ::: "memory");
+    ESPRADIO_INTC_ENABLE_REG |=  (1u << ESPRADIO_WIFI_CPU_INT);
+}
+
+/* Raise WiFi CPU interrupt priority above the global threshold (5)
+ * so that hardware interrupts actually fire.  interrupt.Enable() sets
+ * priority to 5 which equals the threshold — not sufficient on ESP32-C3
+ * where the condition is priority > threshold. */
+void espradio_wifi_int_raise_priority(void) {
+    ESPRADIO_INTC_PRI_REG(ESPRADIO_WIFI_CPU_INT) = 6u;
+    __asm__ volatile ("fence" ::: "memory");
+}
+
+/* INTC enable snapshot taken at the start of schedOnce(), before any blob
+ * code runs.  espradio_wifi_unmask() ORs this back so that bits cleared by
+ * blob OS-adapter ints_off or ROM calls during processing are restored — e.g.
+ * bit 6 which TinyGo uses for GPIO on ESP32-C3. */
+static volatile uint32_t s_intenable_snapshot;
+
+void espradio_snapshot_intenable(void) {
+    s_intenable_snapshot = ESPRADIO_INTC_ENABLE_REG;
+}
+
+/* No unmask rate limit needed here, but the accessors must exist because the
+ * shared Go side reports them for every target.
+ *
+ * The C3 does not have the interrupt storm the Xtensa targets do: its handler runs
+ * the blob ISR inline in interrupt context, which acks the MAC before returning, so
+ * the line is not still asserted when the pass unmasks it.  Measured, this target
+ * takes single-digit hardware interrupts per second where the S3 takes 45,000.
+ * Rate-limiting the unmask here would only add latency for nothing. */
+void espradio_set_unmask_interval_us(uint32_t us) { (void)us; }
+uint32_t espradio_unmask_interval_us(void)        { return 0; }
+uint32_t espradio_unmask_suppressed(void)         { return 0; }
+
+/* No-op on RISC-V: PS.INTLEVEL does not exist. */
+void espradio_lower_intlevel(void) {
+}
+
+/* Called at the end of espradio_call_wifi_isr().  In level-triggered
+ * mode, mask CPU int 1 via the enable register to prevent re-entry
+ * if the hardware line is still asserted after the blob ISR ran.
+ * The bottom-half (schedOnce) unmasks after processing queued work. */
+void espradio_wifi_isr_post_mask(void) {
+    if ((ESPRADIO_INTC_TYPE_REG & (1u << ESPRADIO_WIFI_CPU_INT)) == 0) {
+        ESPRADIO_INTC_ENABLE_REG &= ~(1u << ESPRADIO_WIFI_CPU_INT);
+    }
+}
+
+void espradio_wifi_unmask(void) {
+    /* Restore any TinyGo-owned INTC enable bits that blob code may have
+     * cleared, then ensure the WiFi CPU interrupt is enabled. */
+    ESPRADIO_INTC_ENABLE_REG |= s_intenable_snapshot | (1u << ESPRADIO_WIFI_CPU_INT);
+
+    /* Re-route GPIO source → TinyGo's CPU interrupt in case blob ROM code
+     * (direct intr_matrix_set calls inside the binary) corrupted it during
+     * schedOnce() processing. */
+    intr_matrix_set(0, ETS_GPIO_INTR_SOURCE, ESPRADIO_GPIO_CPU_INT);
+
+    /* Re-fire GPIO CPU interrupt if it was registered and its INTC enable bit
+     * was cleared during schedOnce (blob ets_isr_mask or ints_off).  On
+     * RISC-V, GPIO is level-triggered so toggling the ENABLE bit causes the
+     * controller to re-sample the level and assert the interrupt if the GPIO
+     * source is still pending. */
+    if (s_intenable_snapshot & (1u << ESPRADIO_GPIO_CPU_INT)) {
+        ESPRADIO_INTC_ENABLE_REG &= ~(1u << ESPRADIO_GPIO_CPU_INT);
+        __asm__ volatile ("fence" ::: "memory");
+        ESPRADIO_INTC_ENABLE_REG |=  (1u << ESPRADIO_GPIO_CPU_INT);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * BLE Interrupt Wiring
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* CPU interrupt numbers for BT — must match ble.go constants */
+#define BT_CPU_INT_5  28u  /* RWBT + BT_BB sources */
+#define BT_CPU_INT_8  30u  /* RWBLE source */
+
+/* Called from Go after BLE init to wire BT peripheral sources to CPU
+ * interrupts and enable them with level-triggered mode, priority > threshold(5). */
+void espradio_bt_enable_hw_interrupts(void) {
+    /* Route BT peripheral sources via interrupt matrix */
+    intr_matrix_set(0, ETS_BT_BB_INTR_SOURCE, BT_CPU_INT_5);
+    intr_matrix_set(0, ETS_RWBT_INTR_SOURCE,  BT_CPU_INT_5);
+    intr_matrix_set(0, ETS_RWBLE_INTR_SOURCE, BT_CPU_INT_8);
+
+    /* Level-triggered: BLE peripheral holds the line asserted until the ISR
+     * clears the status. Level mode auto re-fires if still asserted after
+     * handler returns — no missed events. Clear TYPE bits = level. */
+    ESPRADIO_INTC_TYPE_REG &= ~((1u << BT_CPU_INT_5) | (1u << BT_CPU_INT_8));
+
+    /* Set priority > CPU_INT_THRESH (5) so interrupts actually fire */
+    ESPRADIO_INTC_PRI_REG(BT_CPU_INT_5) = 7u;
+    ESPRADIO_INTC_PRI_REG(BT_CPU_INT_8) = 7u;
+
+    /* Enable the CPU interrupts */
+    ESPRADIO_INTC_ENABLE_REG |= (1u << BT_CPU_INT_5) | (1u << BT_CPU_INT_8);
+
+    __asm__ volatile ("fence" ::: "memory");
+}

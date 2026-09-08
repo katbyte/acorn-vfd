@@ -1,0 +1,10 @@
+.claude/
+.DS_Store
+.idea/
+/acornvfd
+*.test
+*.out
+/dist/
+.tools/bin/
+.tools/venv/
+/apk/

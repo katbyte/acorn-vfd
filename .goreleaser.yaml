@@ -1,0 +1,60 @@
+version: 2
+
+project_name: acornvfd
+
+builds:
+  # linux (BlueZ over D-Bus) and windows (WinRT) are pure Go and cross-compile from anywhere
+  - id: nocgo
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -mod=vendor
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/katbyte/acornvfd/lib/version.Version={{ .Tag }}
+      - -X github.com/katbyte/acornvfd/lib/version.GitCommit={{ .ShortCommit }}
+
+  # darwin needs cgo for CoreBluetooth, so this build only works when goreleaser runs on macOS
+  - id: darwin
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+      - -mod=vendor
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/katbyte/acornvfd/lib/version.Version={{ .Tag }}
+      - -X github.com/katbyte/acornvfd/lib/version.GitCommit={{ .ShortCommit }}
+
+universal_binaries:
+  - ids: [darwin]
+    replace: false # also ship a single fat darwin binary alongside amd64/arm64
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  filters:
+    exclude:
+      - '^Bump '
+      - 'merge main'

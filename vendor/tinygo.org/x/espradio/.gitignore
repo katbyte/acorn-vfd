@@ -1,0 +1,7 @@
+esp-wifi
+/.vscode
+/local
+*.bin
+*.elf
+build
+*.log

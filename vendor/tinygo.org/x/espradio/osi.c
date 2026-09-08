@@ -1,0 +1,1866 @@
+#include "esp_coexist_internal.h"
+#include "espradio.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+/* Set to 1 to enable OSI callback logs (e.g. CGO_CFLAGS=-DESPRADIO_OSI_DEBUG=1). */
+#ifndef ESPRADIO_OSI_DEBUG
+#define ESPRADIO_OSI_DEBUG 0
+#endif
+
+#define ESPRADIO_PHY_MODEM_WIFI 1u
+
+extern wifi_osi_funcs_t espradio_osi_funcs;
+static void espradio_wifi_reset_mac(void);
+void espradio_timer_pending_reset(void);
+
+__attribute__((weak)) wifi_osi_funcs_t *g_osi_funcs_p;
+
+/* Declared in radio.c — heap-allocated OSI table placed far from BSS to avoid
+ * WiFi DMA corruption.  All runtime table updates go here AND to g_wifi_osi_funcs. */
+extern wifi_osi_funcs_t *s_heap_osi_funcs __attribute__((weak));
+
+static void espradio_sync_osi_tables(void) {
+    memcpy(&g_wifi_osi_funcs, &espradio_osi_funcs, sizeof(wifi_osi_funcs_t));
+    if (s_heap_osi_funcs) {
+        memcpy(s_heap_osi_funcs, &espradio_osi_funcs, sizeof(wifi_osi_funcs_t));
+    }
+    /* NOTE: do NOT set g_osi_funcs_p here.  The blob's wifi_osi_funcs_register
+     * checks "g_osi_funcs_p != 0" at entry and returns immediately if it is
+     * already set, skipping critical blob-internal variable initialization.
+     * g_osi_funcs_p is set by the blob inside esp_wifi_init_internal(). */
+}
+
+void espradio_prepare_memory_for_wifi(void) {
+    espradio_sync_osi_tables();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: prepare_memory_for_wifi (no-op wdev_last_desc_reset_ptr)\n");
+#endif
+}
+
+void espradio_ensure_osi_ptr(void) {
+    espradio_sync_osi_tables();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: ensure_osi_ptr\n");
+#endif
+}
+
+extern void espradio_post_start_cb(void);
+
+esp_err_t espradio_esp_wifi_start(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: esp_wifi_start (write table then call blob)\n");
+#endif
+    memcpy(&g_wifi_osi_funcs, &espradio_osi_funcs, sizeof(wifi_osi_funcs_t));
+    if (s_heap_osi_funcs) {
+        memcpy(s_heap_osi_funcs, &espradio_osi_funcs, sizeof(wifi_osi_funcs_t));
+    }
+    espradio_timer_pending_reset();
+    esp_err_t rc = esp_wifi_start();
+    if (rc == ESP_OK) {
+        espradio_post_start_cb();
+    }
+    return rc;
+}
+
+/* Simple printf backend expected by libcoexist.a. */
+__attribute__((weak)) void coexist_printf(const char *format, ...) {
+#if ESPRADIO_OSI_DEBUG
+    va_list args;
+    va_start(args, format);
+    printf("coexist: ");
+    vprintf(format, args);
+    va_end(args);
+#endif
+}
+
+/**************************************************************************
+ * Name: wifi_env_is_chip
+ *
+ * Description:
+ *   Config chip environment.
+ *
+ * Returned Value:
+ *   True if on chip or false if on FPGA.
+ *************************************************************************/
+static bool espradio_env_is_chip(void) {
+    return true;
+}
+
+/* ISR functions — defined in isr.c */
+void espradio_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num, int32_t intr_prio);
+void espradio_clear_intr(uint32_t intr_source, uint32_t intr_num);
+void espradio_set_isr(int32_t n, void *f, void *arg);
+bool espradio_is_from_isr(void);
+void espradio_ints_on(uint32_t mask);
+void espradio_ints_off(uint32_t mask);
+void espradio_task_yield_from_isr(void);
+int32_t espradio_queue_send_from_isr(void *queue, void *item, void *hptw);
+
+void *espradio_spin_lock_create(void);
+void espradio_yield_and_fire_pending_timers(void);
+void espradio_task_yield_go(void);
+uint32_t espradio_queue_len(void *ptr);
+
+void espradio_spin_lock_delete(void *lock);
+
+uint32_t espradio_wifi_int_disable(void *wifi_int_mux);
+
+void espradio_wifi_int_restore(void *wifi_int_mux, uint32_t tmp);
+
+void *espradio_semphr_create(uint32_t max, uint32_t init);
+
+void espradio_semphr_delete(void *semphr);
+
+int32_t espradio_semphr_take(void *semphr, uint32_t block_time_tick);
+
+int32_t espradio_semphr_give(void *semphr);
+
+void *espradio_wifi_thread_semphr_get(void);
+
+void *espradio_recursive_mutex_create(void);
+void *espradio_arena_alloc(size_t size);
+void espradio_arena_free(void *p);
+
+static void *espradio_mutex_create(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: mutex_create\n");
+#endif
+    void *ret = espradio_recursive_mutex_create();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: mutex_create -> %p\n", ret);
+#endif
+    return ret;
+}
+
+void espradio_mutex_delete(void *mutex);
+
+int32_t espradio_mutex_lock(void *mutex);
+
+int32_t espradio_mutex_unlock(void *mutex);
+
+typedef struct espradio_queue {
+    void *handle;
+    uint8_t *storage;
+    uint32_t len;
+    uint32_t item_size;
+    uint32_t read;
+    uint32_t write;
+    uint32_t count;
+    int lock;
+    struct espradio_queue *next_queue;
+} espradio_queue_t;
+
+static espradio_queue_t *s_queues_head;
+static int s_queues_lock;
+
+/* These spins must yield.
+ *
+ * There is one core and no preemption, so if the holder is another goroutine a
+ * bare spin never terminates -- the holder can only run if we give it the CPU.
+ * event_lock() below already does this; these two did not, which is the bug.
+ *
+ * Yielding here is safe precisely because these are our own locks around our own
+ * queue bookkeeping.  It would NOT be safe inside a region the blob treats as a
+ * critical section: yielding out of one of those is what let two contexts
+ * re-enter the BLE controller's rw_schedule() and deliver a single ACL packet to
+ * the host twice, permanently desynchronising the ATT request/response stream.
+ * The distinction is whose invariant the lock protects, not the lock's shape.
+ *
+ * In real interrupt context there is no goroutine to yield from, so spin instead.
+ * That case tests espradio_in_hw_isr() rather than the blob-facing _is_from_isr,
+ * which is also true when the blob's ISR body runs on the scheduler goroutine. */
+static void spin_yield(void) {
+    if (espradio_in_hw_isr()) return;
+    espradio_task_yield_go();
+}
+
+static void queue_list_lock(void) {
+    while (__sync_lock_test_and_set(&s_queues_lock, 1)) {
+        spin_yield();
+    }
+}
+
+static void queue_list_unlock(void) {
+    __sync_lock_release(&s_queues_lock);
+}
+
+static void queue_lock(espradio_queue_t *q) {
+    while (__sync_lock_test_and_set(&q->lock, 1)) {
+        spin_yield();
+    }
+}
+
+static void queue_unlock(espradio_queue_t *q) {
+    __sync_lock_release(&q->lock);
+}
+
+static espradio_queue_t *queue_resolve(void *ptr) {
+    if (!ptr) return NULL;
+    queue_list_lock();
+    for (espradio_queue_t *q = s_queues_head; q; q = q->next_queue) {
+        if (ptr == q || *(void **)ptr == q) {
+            queue_list_unlock();
+            return q;
+        }
+    }
+    queue_list_unlock();
+    return NULL;
+}
+
+static espradio_queue_t *queue_unlink(void *ptr) {
+    if (!ptr) return NULL;
+    queue_list_lock();
+    espradio_queue_t *prev = NULL;
+    for (espradio_queue_t *q = s_queues_head; q; q = q->next_queue) {
+        if (ptr == q || *(void **)ptr == q) {
+            if (prev) {
+                prev->next_queue = q->next_queue;
+            } else {
+                s_queues_head = q->next_queue;
+            }
+            q->next_queue = NULL;
+            queue_list_unlock();
+            return q;
+        }
+        prev = q;
+    }
+    queue_list_unlock();
+    return NULL;
+}
+
+void *espradio_generic_queue_create(uint32_t queue_len, uint32_t item_size) {
+    if (queue_len < 1) queue_len = 1;
+    if (item_size < 1) item_size = 1;
+    espradio_queue_t *q = (espradio_queue_t *)espradio_arena_alloc(sizeof(*q));
+    if (!q) {
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: queue_create failed: alloc queue len=%lu size=%lu\n",
+               (unsigned long)queue_len, (unsigned long)item_size);
+#endif
+        return NULL;
+    }
+    size_t bytes = (size_t)queue_len * (size_t)item_size;
+    q->storage = (uint8_t *)espradio_arena_alloc(bytes);
+    if (!q->storage) {
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: queue_create failed: alloc storage bytes=%lu len=%lu size=%lu\n",
+               (unsigned long)bytes, (unsigned long)queue_len, (unsigned long)item_size);
+#endif
+        espradio_arena_free(q);
+        return NULL;
+    }
+    q->len = queue_len;
+    q->item_size = item_size;
+    q->read = 0;
+    q->write = 0;
+    q->count = 0;
+    q->lock = 0;
+    q->handle = q;
+    queue_list_lock();
+    q->next_queue = s_queues_head;
+    s_queues_head = q;
+    queue_list_unlock();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_create q=%p len=%lu size=%lu\n",
+           (void *)q, (unsigned long)queue_len, (unsigned long)item_size);
+#endif
+    return &q->handle;
+}
+
+void espradio_generic_queue_delete(void *queue) {
+    espradio_queue_t *q = queue_unlink(queue);
+    if (!q) return;
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_delete q=%p len=%lu size=%lu\n",
+           (void *)q, (unsigned long)q->len, (unsigned long)q->item_size);
+#endif
+    queue_lock(q);
+    espradio_arena_free(q->storage);
+    q->storage = NULL;
+    q->len = 0;
+    q->item_size = 0;
+    q->read = 0;
+    q->write = 0;
+    q->count = 0;
+    q->handle = NULL;
+    queue_unlock(q);
+    espradio_arena_free(q);
+}
+
+static void *espradio_queue_create(uint32_t queue_len, uint32_t item_size) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_create len=%lu size=%lu\n", (unsigned long)queue_len, (unsigned long)item_size);
+#endif
+    return espradio_generic_queue_create(queue_len, item_size);
+}
+
+static void espradio_queue_delete(void *queue) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_delete %p\n", queue);
+#endif
+    espradio_generic_queue_delete(queue);
+}
+
+/* Counts sends rejected because the destination queue was full.  block_time_tick
+ * is ignored, so a blob "blocking" send never blocks and the item is simply
+ * lost; this counter is the only evidence that happened. */
+static volatile uint32_t s_queue_send_full;
+
+uint32_t espradio_queue_send_full_count(void) { return s_queue_send_full; }
+
+int32_t espradio_queue_send(void *queue, void *item, uint32_t block_time_tick) {
+    (void)block_time_tick;
+    espradio_queue_t *q = queue_resolve(queue);
+    if (!q || !item) return 0;
+    queue_lock(q);
+    if (q->count == q->len) {
+        queue_unlock(q);
+        s_queue_send_full++;
+        return 0;
+    }
+    memcpy(q->storage + ((size_t)q->write * q->item_size), item, q->item_size);
+    q->write++;
+    if (q->write == q->len) q->write = 0;
+    q->count++;
+    queue_unlock(q);
+    return 1;
+}
+
+static int32_t espradio_queue_send_to_back(void *queue, void *item, uint32_t block_time_tick) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_send_to_back q=%p tick=%lu\n", queue, (unsigned long)block_time_tick);
+#endif
+    return espradio_queue_send(queue, item, block_time_tick);
+}
+
+static int32_t espradio_queue_send_to_front(void *queue, void *item, uint32_t block_time_tick) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_send_to_front q=%p tick=%lu\n", queue, (unsigned long)block_time_tick);
+#endif
+    return espradio_queue_send(queue, item, block_time_tick);
+}
+
+int32_t espradio_queue_recv(void *queue, void *item, uint32_t block_time_tick) {
+    espradio_queue_t *q = queue_resolve(queue);
+    if (!q || !item) return 0;
+
+    /* Cap "forever" timeout to 10ms so BLE controller task wakes periodically.
+     * Without this, the task blocks indefinitely on g_rw_schd_queue and never
+     * runs ke_task_schedule/btdm_rw_run to process scan scheduling. */
+    uint64_t deadline = 0;
+    int forever = 0;
+    if (block_time_tick == OSI_FUNCS_TIME_BLOCKING || block_time_tick > 10) {
+        block_time_tick = 10; /* cap to 10ms */
+    }
+    if (block_time_tick != 0) {
+        deadline = espradio_time_us_now() + ((uint64_t)block_time_tick * 1000ULL);
+    }
+
+    for (;;) {
+        queue_lock(q);
+        if (q->count != 0) {
+            memcpy(item, q->storage + ((size_t)q->read * q->item_size), q->item_size);
+            q->read++;
+            if (q->read == q->len) q->read = 0;
+            q->count--;
+            queue_unlock(q);
+            return 1;
+        }
+        queue_unlock(q);
+
+        if (block_time_tick == 0) {
+            espradio_task_yield_go(); /* yield on failed non-blocking recv (prevents BT task starvation) */
+            return 0;
+        }
+        if (!forever && espradio_time_us_now() >= deadline) return 0;
+        espradio_task_yield_go();
+    }
+}
+
+static uint32_t espradio_queue_msg_waiting(void *queue) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_msg_waiting q=%p\n", (void *)queue);
+#endif
+    espradio_queue_t *q = queue_resolve(queue);
+    if (!q) return 0;
+    queue_lock(q);
+    uint32_t count = q->count;
+    queue_unlock(q);
+    return count;
+}
+
+uint32_t espradio_queue_len(void *queue) {
+    return espradio_queue_msg_waiting(queue);
+}
+
+void *espradio_wifi_create_queue(int queue_len, int item_size) {
+    return espradio_generic_queue_create((uint32_t)queue_len, (uint32_t)item_size);
+}
+
+void espradio_wifi_delete_queue(void *queue) {
+    espradio_generic_queue_delete(queue);
+}
+
+/* ─── BLE-accessible queue wrappers (bt_ble.c uses these) ─── */
+void *espradio_queue_create_internal(uint32_t len, uint32_t item_size) {
+    return espradio_generic_queue_create(len, item_size);
+}
+void espradio_queue_delete_internal(void *queue) {
+    espradio_generic_queue_delete(queue);
+}
+int32_t espradio_queue_recv_from_isr(void *queue, void *item, void *hptw) {
+    (void)hptw;
+    return espradio_queue_recv(queue, item, 0);
+}
+
+/* Event group functions — implemented in Go (radio.go), declared here
+ * so the OSI table references the Go exports instead of stale C stubs. */
+void *espradio_event_group_create(void);
+void  espradio_event_group_delete(void *event);
+uint32_t espradio_event_group_set_bits(void *event, uint32_t bits);
+uint32_t espradio_event_group_clear_bits(void *event, uint32_t bits);
+uint32_t espradio_event_group_wait_bits(void *event, uint32_t bits_to_wait_for,
+                                        int clear_on_exit, int wait_for_all_bits,
+                                        uint32_t block_time_tick);
+
+void espradio_run_task(void *task_func, void *task_handle) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: run_task fn=%p\n", (void *)task_func);
+#endif
+    void (*fn)(void *task_handle) = task_func;
+    fn(task_handle);
+}
+
+int32_t espradio_task_create_pinned_to_core(void *task_func, const char *name, uint32_t stack_depth, void *param, uint32_t prio, void *task_handle, uint32_t core_id);
+
+static int32_t espradio_task_create(void *task_func, const char *name, uint32_t stack_depth, void *param, uint32_t prio, void *task_handle) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: task_create name=%s fn=%p stack=%lu prio=%lu param=%p\n",
+           name ? name : "(null)", task_func, (unsigned long)stack_depth, (unsigned long)prio, param);
+    printf("CCHK: task_create called\n");
+    fflush(stdout);
+#endif
+    return espradio_task_create_pinned_to_core(task_func, name, stack_depth, param, prio, task_handle, 0);
+}
+
+void espradio_task_delete(void *task_handle);
+
+void espradio_task_delay(uint32_t tick);
+
+int32_t espradio_task_ms_to_tick(uint32_t ms);
+
+void *espradio_task_get_current_task(void);
+
+static int32_t espradio_task_get_max_priority(void) {
+    return 255;
+}
+
+static unsigned espradio_alloc_count;
+static unsigned espradio_free_count;
+
+void *espradio_arena_alloc(size_t size);
+void *espradio_arena_calloc(size_t n, size_t size);
+void *espradio_arena_realloc(void *ptr, size_t new_size);
+void  espradio_arena_free(void *p);
+
+/* Non-static so bt_ble.c can route BLE allocations through the same counters.
+ * The BT controller draws from the same arena as WiFi, so allocations that
+ * bypass these wrappers are invisible to espradio_alloc_stats(). */
+void *espradio_malloc(size_t size) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: malloc %zu\n", size);
+#endif
+    espradio_alloc_count++;
+    return espradio_arena_alloc(size);
+}
+
+void espradio_free(void *p) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: free %p\n", (void *)p);
+#endif
+    if (p) espradio_free_count++;
+    espradio_arena_free(p);
+}
+
+/* Minimal esp_event implementation: queue events, dispatch from run_once (called from Go).
+ * Matches IDF semantics so the driver sees _event_post return 0 and does not take the error path. */
+typedef struct event_item {
+    char *base;
+    int32_t id;
+    void *data;
+    size_t data_size;
+    struct event_item *next;
+} event_item_t;
+typedef struct event_handler {
+    esp_event_base_t base;
+    int32_t id;
+    esp_event_handler_t handler;
+    void *arg;
+    struct event_handler *next;
+} event_handler_t;
+static event_item_t *s_event_head;
+static event_item_t *s_event_tail;
+static event_handler_t *s_handler_head;
+static volatile int s_event_loop_ready;
+static int s_event_lock;
+static unsigned s_event_queued;
+static const char s_wifi_event_base[] = "WIFI_EVENT";
+static void event_lock(void) {
+    unsigned spins = 0;
+    while (__sync_lock_test_and_set(&s_event_lock, 1)) {
+        spins++;
+#if ESPRADIO_OSI_DEBUG
+        if ((spins & 0x3ff) == 0) {
+            printf("osi: event_lock waiting spins=%u queued=%u\n", spins, (unsigned)s_event_queued);
+        }
+#endif
+        espradio_task_yield_go();
+    }
+}
+static void event_unlock(void) {
+    __sync_lock_release(&s_event_lock);
+}
+
+static char *dup_str(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)espradio_arena_alloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+esp_err_t esp_event_loop_create_default(void) {
+    s_event_head = s_event_tail = NULL;
+    s_handler_head = NULL;
+    s_event_loop_ready = 1;
+    return 0;
+}
+esp_err_t esp_event_loop_delete_default(void) {
+    s_event_loop_ready = 0;
+    event_lock();
+    while (s_event_head) {
+        event_item_t *e = s_event_head;
+        s_event_head = e->next;
+        if (e->base != s_wifi_event_base)
+            espradio_arena_free(e->base);
+        espradio_arena_free(e->data);
+        espradio_arena_free(e);
+    }
+    s_event_tail = NULL;
+    while (s_handler_head) {
+        event_handler_t *h = s_handler_head;
+        s_handler_head = h->next;
+        espradio_arena_free(h);
+    }
+    event_unlock();
+    return 0;
+}
+esp_err_t esp_event_handler_register(esp_event_base_t event_base, int32_t event_id,
+                                     esp_event_handler_t event_handler, void *event_handler_arg) {
+    event_handler_t *h = (event_handler_t *)espradio_arena_alloc(sizeof(*h));
+    if (!h) return -1;
+    h->base = event_base;
+    h->id = event_id;
+    h->handler = event_handler;
+    h->arg = event_handler_arg;
+    h->next = s_handler_head;
+    s_handler_head = h;
+    return 0;
+}
+
+/* Returns 1 if an event was dispatched, 0 if the queue was empty.  The caller
+ * (schedOnce) needs this to tell "drained" from "still has work" -- without it a
+ * fixed-count drain loop cannot know whether it ran out of passes. */
+int espradio_event_loop_run_once(void) {
+    if (!s_event_loop_ready) return 0;
+#if ESPRADIO_OSI_DEBUG
+    static uint32_t s_event_loop_idle_log_throttle = 0;
+    if ((s_event_loop_idle_log_throttle & 0x1ffu) == 0) {
+        printf("osi: event_loop_run_once enter queued=%u\n", (unsigned)s_event_queued);
+    }
+#endif
+    event_lock();
+    event_item_t *e = s_event_head;
+    if (!e) {
+        event_unlock();
+#if ESPRADIO_OSI_DEBUG
+        if ((s_event_loop_idle_log_throttle & 0x1ffu) == 0) {
+            printf("osi: event_loop_run_once empty\n");
+        }
+        s_event_loop_idle_log_throttle++;
+#endif
+        return 0;
+    }
+    s_event_head = e->next;
+    if (!s_event_head) s_event_tail = NULL;
+    if (s_event_queued > 0) s_event_queued--;
+    event_unlock();
+#if ESPRADIO_OSI_DEBUG
+    s_event_loop_idle_log_throttle = 0;
+    printf("osi: event_loop_run_once dispatch base=%s id=%ld queued=%u\n",
+           e->base ? e->base : "(null)", (long)e->id, (unsigned)s_event_queued);
+#endif
+    const char *base = e->base ? e->base : "(null)";
+    for (event_handler_t *h = s_handler_head; h; h = h->next) {
+        if ((!h->base || strcmp(h->base, base) == 0) && (h->id == ESP_EVENT_ANY_ID || h->id == e->id) && h->handler) {
+            uintptr_t ha = (uintptr_t)h->handler;
+            if (ha < 0x40000000u || ha >= 0x42800000u) {
+                printf("osi: event_loop BAD handler=%p base=%s id=%ld — skipping\n",
+                       (void *)h->handler, base, (long)e->id);
+                continue;
+            }
+            h->handler(h->arg, (esp_event_base_t)base, e->id, e->data);
+        }
+    }
+    if (e->base != s_wifi_event_base)
+        espradio_arena_free(e->base);
+    espradio_arena_free(e->data);
+    espradio_arena_free(e);
+    return 1;
+}
+
+extern void espradio_on_wifi_event(int32_t event_id, void *data);
+
+static void espradio_wifi_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg;
+    espradio_on_wifi_event(id, data);
+}
+
+void espradio_event_register_default_cb(void) {
+    if (esp_event_loop_create_default() != 0) return;
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, espradio_wifi_event_cb, NULL);
+}
+
+/**************************************************************************
+ * Name: esp_event_post (osi _event_post)
+ * Queue event and return 0 so driver does not take the error path.
+ * Called from WiFi task, including for HOME_CHANNEL_CHANGE (41/43).
+ *************************************************************************/
+esp_err_t esp_event_post(esp_event_base_t event_base, int32_t event_id, const void* event_data, size_t event_data_size, uint32_t ticks_to_wait) {
+    (void)ticks_to_wait;
+#if ESPRADIO_OSI_DEBUG
+    printf("CCHK: event_post called\n");
+    fflush(stdout);
+    uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, b7 = 0;
+    uint32_t scan_status = 0;
+    uint8_t scan_number = 0;
+    uint8_t scan_id = 0;
+    if (event_data && event_data_size > 0) {
+        const uint8_t *p = (const uint8_t *)event_data;
+        b0 = p[0];
+        if (event_data_size > 1) b1 = p[1];
+        if (event_data_size > 2) b2 = p[2];
+        if (event_data_size > 3) b3 = p[3];
+        if (event_data_size > 4) b4 = p[4];
+        if (event_data_size > 5) b5 = p[5];
+        if (event_data_size > 6) b6 = p[6];
+        if (event_data_size > 7) b7 = p[7];
+        if (event_data_size >= 6 && event_base && strcmp(event_base, s_wifi_event_base) == 0 && event_id == 1) {
+            scan_status = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+            scan_number = b4;
+            scan_id = b5;
+        }
+    }
+    printf("osi: event_post base=%s id=%ld size=%zu data=%p bytes=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
+           event_base ? event_base : "(null)",
+           (long)event_id,
+           (size_t)event_data_size,
+           event_data,
+           (unsigned)b0, (unsigned)b1, (unsigned)b2, (unsigned)b3,
+           (unsigned)b4, (unsigned)b5, (unsigned)b6, (unsigned)b7);
+    if (event_base && strcmp(event_base, s_wifi_event_base) == 0 && event_id == 1 && event_data_size >= 6) {
+        extern uint32_t espradio_get_wifi_isr_count(void);
+        uint32_t intenable, interrupt_reg;
+        #ifdef __XTENSA__
+        __asm__ volatile ("rsr %0, intenable" : "=r"(intenable));
+        __asm__ volatile ("rsr %0, interrupt" : "=r"(interrupt_reg));
+        #else
+        intenable = 0; interrupt_reg = 0;
+        #endif
+        volatile uint32_t *int_map = (volatile uint32_t *)0x600C2000;
+        printf("osi: scan_done isr=%lu INTEN=0x%08lx INT=0x%08lx MAC_MAP=%lu BB_MAP=%lu PWR_MAP=%lu\n",
+               (unsigned long)espradio_get_wifi_isr_count(),
+               (unsigned long)intenable, (unsigned long)interrupt_reg,
+               (unsigned long)(int_map[0] & 0x1f),
+               (unsigned long)(int_map[2] & 0x1f),
+               (unsigned long)(int_map[3] & 0x1f));
+    }
+#endif
+    if (!s_event_loop_ready) return 0;
+    event_item_t *e = (event_item_t *)espradio_arena_alloc(sizeof(*e));
+    if (!e) return -1;
+    if (event_base && strcmp(event_base, s_wifi_event_base) == 0)
+        e->base = (char *)s_wifi_event_base;
+    else
+        e->base = dup_str(event_base);
+    e->id = event_id;
+    e->data_size = event_data_size;
+    e->data = NULL;
+    if (event_data_size > 0 && event_data) {
+        e->data = espradio_arena_alloc(event_data_size);
+        if (e->data) memcpy(e->data, event_data, event_data_size);
+    }
+    e->next = NULL;
+    event_lock();
+    if (s_event_tail) s_event_tail->next = e;
+    else s_event_head = e;
+    s_event_tail = e;
+    s_event_queued++;
+    event_unlock();
+    // Keep esp_event_post asynchronous (IDF-like): wake scheduler and yield.
+    espradio_task_yield_go();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: event_post queued base=%s id=%ld queued=%u\n",
+           event_base ? event_base : "(null)", (long)event_id, (unsigned)s_event_queued);
+#endif
+    return 0;
+}
+
+/**************************************************************************
+ * Name: esp_get_free_heap_size
+ *
+ * Description:
+ *   Get free heap size by byte.
+ *
+ * Returned Value:
+ *   Free heap size.
+ *************************************************************************/
+static uint32_t espradio_get_free_heap_size(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: get_free_heap_size\n");
+#endif
+    return 256 * 1024;
+}
+
+static uint32_t espradio_rand(void) {
+    static uint32_t s_rng = 0x9e3779b9u;
+    uint32_t t = (uint32_t)espradio_time_us_now();
+    s_rng ^= t + 0x85ebca6bu + (s_rng << 6) + (s_rng >> 2);
+    s_rng ^= s_rng << 13;
+    s_rng ^= s_rng >> 17;
+    s_rng ^= s_rng << 5;
+    return s_rng;
+}
+
+static void espradio_dport_access_stall_other_cpu_start_wrap(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: dport_start_wrap\n");
+#endif
+}
+
+static void espradio_dport_access_stall_other_cpu_end_wrap(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: dport_end_wrap\n");
+#endif
+}
+
+/* Stub: request 80 MHz APB clock for WiFi — no-op (clocks are already enabled in init). */
+static void espradio_wifi_apb80m_request(void) {
+}
+
+static void espradio_wifi_apb80m_release(void) {
+}
+
+/* The blob calls _wifi_clock_enable/_wifi_clock_disable asymmetrically
+ * (more disables than enables).  With a ref-counted implementation the
+ * ref count eventually underflows, powering down the WiFi domain while
+ * the radio is still active → pc:nil.  Rust esp-wifi discovered this
+ * and makes both callbacks no-ops; clocks are pre-enabled once at boot
+ * via espradio_hal_init_clocks_go() in Enable(). */
+static void espradio_wifi_clock_enable_noop(void) { }
+static void espradio_wifi_clock_disable_noop(void) { }
+
+/* Same issue for RTC isolation: the blob toggles ISO asymmetrically. */
+static void espradio_wifi_rtc_enable_iso_noop(void) { }
+static void espradio_wifi_rtc_disable_iso_noop(void) { }
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_ESP_WIFI_TARGET_ESP32
+extern void esp_phy_common_clock_enable(void);
+extern void esp_phy_common_clock_disable(void);
+#endif
+
+static void espradio_phy_disable(void) {
+    phy_wifi_enable_set(0);
+    esp_phy_disable(ESPRADIO_PHY_MODEM_WIFI);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: phy_disable\n");
+#endif
+}
+
+static void espradio_phy_enable(void) {
+    esp_phy_enable(ESPRADIO_PHY_MODEM_WIFI);
+    phy_wifi_enable_set(1);
+#ifdef __XTENSA__
+    /* PHY blob may re-enable glitch/brownout detectors; re-disable them. */
+    *(volatile uint32_t *)0x60008034 &= ~(1u << 20);        /* GLITCH_RST_EN=0 */
+    *(volatile uint32_t *)0x60008148 = 0x0;                  /* FIB_SEL=0 (use register, not eFuse) */
+    *(volatile uint32_t *)0x60008144 &= ~(1u << 31);        /* POWER_GLITCH_EN=0 */
+    *(volatile uint32_t *)0x600080E8 &= ~((1u << 30) | (1u << 26)); /* BOD off */
+#endif
+}
+
+static int espradio_phy_update_country_info(const char* country) {
+    static char s_country[4];
+    if (country) {
+        s_country[0] = country[0];
+        s_country[1] = country[1];
+        s_country[2] = country[2];
+        s_country[3] = 0;
+    } else {
+        s_country[0] = 0;
+        s_country[1] = 0;
+        s_country[2] = 0;
+        s_country[3] = 0;
+    }
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: phy_update_country_info country=%p iso=%s\n",
+           (void *)country, s_country);
+#endif
+    return 0;
+}
+
+/* Stub: returns a zero MAC; production should read from eFuse. */
+static int espradio_read_mac(uint8_t* mac, unsigned int type) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: read_mac type=%u\n", type);
+#endif
+    if (mac == NULL) {
+        return -1;
+    }
+
+    int rc = espradio_hal_read_mac_go(mac, type);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: read_mac rc=%d -> %02x:%02x:%02x:%02x:%02x:%02x\n",
+           rc, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#endif
+    return rc;
+}
+
+/* On ESP32, place WiFi-only tables in DRAM1 (.wifibss) to free SRAM2. */
+#if CONFIG_IDF_TARGET_ESP32
+#define WIFIBSS __attribute__((section(".wifibss")))
+#else
+#define WIFIBSS
+#endif
+
+#define TIMER_SLOTS 32
+static struct {
+    void *ptimer;
+    void (*fn)(void *);
+    void *arg;
+    bool active;
+    bool periodic;
+    bool pending_setfn;
+    uint64_t interval_us;
+    uint64_t deadline_us;
+} timer_slots[TIMER_SLOTS] WIFIBSS;
+static unsigned timer_slots_used;
+
+void espradio_timer_fire(void *ptimer);
+
+void espradio_timer_pending_reset(void) {
+    memset(timer_slots, 0, sizeof(timer_slots));
+    timer_slots_used = 0;
+}
+
+static int timer_slot_find(void *ptimer) {
+    for (unsigned i = 0; i < timer_slots_used; i++)
+        if (timer_slots[i].ptimer == ptimer)
+            return (int)i;
+    return -1;
+}
+
+static int timer_slot_alloc(void *ptimer) {
+    int i = timer_slot_find(ptimer);
+    if (i >= 0) return i;
+    if (timer_slots_used >= TIMER_SLOTS) return -1;
+    i = (int)timer_slots_used++;
+    timer_slots[i].ptimer = ptimer;
+    return i;
+}
+
+int espradio_timer_poll_due(int max_fire);
+void espradio_task_yield_go(void);
+
+void espradio_timer_fire(void *ptimer);
+
+/**************************************************************************
+ * Name: timer_setfn
+ *
+ * Description:
+ *   Set timer callback and arg; store in ets_timer (blob) and in slots.
+ *
+ * Input Parameters:
+ *   ptimer    - Timer handle
+ *   pfunction - Callback
+ *   parg      - Callback argument
+ * 1:1 compatibility with esp-wifi timer_compat: timer_setfn only registers callback/arg
+ * and clears active state; the callback executes only via timer_arm/timer_arm_us.
+ *************************************************************************/
+static void espradio_timer_setfn(void *ptimer, void *pfunction, void *parg) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_setfn ptimer=%p fn=%p arg=%p\n", (void *)ptimer, (void *)pfunction, (void *)parg);
+#endif
+    if (ptimer) {
+        struct ets_timer *t = (struct ets_timer *)ptimer;
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_setfn before ptimer=%p expire=%lu period=%lu func=%p priv=%p next=%p\n",
+               (void *)ptimer,
+               (unsigned long)t->expire,
+               (unsigned long)t->period,
+               (void *)t->func,
+               t->priv,
+               (void *)t->next);
+#endif
+        t->next = NULL;
+        t->period = 0;
+        t->func = (void (*)(void *))pfunction;
+        t->priv = parg;
+        t->expire = 0;
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_setfn after  ptimer=%p expire=%lu period=%lu func=%p priv=%p next=%p\n",
+               (void *)ptimer,
+               (unsigned long)t->expire,
+               (unsigned long)t->period,
+               (void *)t->func,
+               t->priv,
+               (void *)t->next);
+#endif
+    }
+    int i = timer_slot_alloc(ptimer);
+    if (i >= 0) {
+        timer_slots[i].fn = (void (*)(void *))pfunction;
+        timer_slots[i].arg = parg;
+        timer_slots[i].active = false;
+        timer_slots[i].periodic = false;
+        timer_slots[i].pending_setfn = false;
+        timer_slots[i].interval_us = 0;
+        timer_slots[i].deadline_us = 0;
+    }
+    // IDF-compatible behavior: timer_setfn only registers callback/arg.
+}
+
+static void espradio_timer_disarm(void *timer) {
+    int i = timer_slot_find(timer);
+    if (i >= 0) {
+        timer_slots[i].active = false;
+        timer_slots[i].pending_setfn = false;
+    }
+}
+
+static void espradio_timer_done(void *ptimer) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_done ptimer=%p\n", (void *)ptimer);
+#endif
+    int i = timer_slot_find(ptimer);
+    if (i >= 0) {
+        timer_slots[i].active = false;
+        timer_slots[i].periodic = false;
+        timer_slots[i].fn = NULL;
+        timer_slots[i].arg = NULL;
+        if ((unsigned)i + 1 < timer_slots_used) {
+            memmove(&timer_slots[i], &timer_slots[i + 1], (timer_slots_used - (unsigned)i - 1) * sizeof(timer_slots[0]));
+        }
+        timer_slots_used--;
+    }
+    if (ptimer) {
+        struct ets_timer *t = (struct ets_timer *)ptimer;
+        t->priv = NULL;
+        t->func = NULL;
+    }
+}
+
+/**************************************************************************
+ * Name: timer_arm
+ *
+ * Description:
+ *   Start timer (one-shot or repeat).
+ *
+ * Input Parameters:
+ *   timer - Timer handle
+ *   tmout - Timeout in ticks
+ *   repeat - true if periodic
+ *************************************************************************/
+static void espradio_timer_arm(void *timer, uint32_t tmout, bool repeat) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_arm timer=%p tmout=%lu repeat=%d\n", (void *)timer, (unsigned long)tmout, (int)repeat);
+#endif
+    int i = timer_slot_find(timer);
+    if (i < 0) {
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_arm not found timer=%p\n", timer);
+#endif
+        return;
+    }
+    uint64_t us = (uint64_t)tmout * 1000ULL;
+    if (us == 0) us = 1;
+    uint64_t now = espradio_time_us_now();
+    timer_slots[i].active = true;
+    timer_slots[i].periodic = repeat;
+    timer_slots[i].pending_setfn = false;
+    timer_slots[i].interval_us = us;
+    timer_slots[i].deadline_us = now + us;
+    if (tmout == 0) {
+        espradio_timer_fire(timer);
+        return;
+    }
+}
+
+void espradio_timer_fire(void *ptimer) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_fire begin ptimer=%p\n", (void *)ptimer);
+#endif
+    int i = timer_slot_find(ptimer);
+    void (*fn)(void *) = NULL;
+    void *arg = NULL;
+    if (i >= 0) {
+        if (!timer_slots[i].active) {
+#if ESPRADIO_OSI_DEBUG
+            printf("osi: timer_fire skip inactive ptimer=%p\n", (void *)ptimer);
+#endif
+            return;
+        }
+        if (!timer_slots[i].periodic) {
+            timer_slots[i].active = false;
+            timer_slots[i].pending_setfn = false;
+        }
+    }
+    if (i >= 0 && timer_slots[i].fn) {
+        fn = timer_slots[i].fn;
+        arg = timer_slots[i].arg;
+    } else if (ptimer) {
+        struct ets_timer *t = (struct ets_timer *)ptimer;
+        fn = t->func;
+        arg = t->priv;
+    }
+ #if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_fire resolved ptimer=%p slot=%d fn=%p arg=%p\n", (void *)ptimer, i, (void *)fn, arg);
+ #endif
+    if (fn) {
+        uintptr_t addr = (uintptr_t)fn;
+        if (addr < 0x40000000u || addr >= 0x42800000u) {
+            printf("osi: timer_fire BAD fn=%p arg=%p ptimer=%p slot=%d — skipping\n",
+                   (void *)fn, arg, (void *)ptimer, i);
+            return;
+        }
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_fire calling fn=%p arg=%p\n", (void *)fn, arg);
+#endif
+        fn(arg);
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_fire returned fn=%p arg=%p\n", (void *)fn, arg);
+#endif
+    }
+#if ESPRADIO_OSI_DEBUG
+    else
+        printf("osi: timer_fire no slot and no fn in ptimer\n");
+    printf("osi: timer_fire end ptimer=%p\n", (void *)ptimer);
+#endif
+}
+
+static void espradio_timer_arm_us(void *ptimer, uint32_t us, bool repeat) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: timer_arm_us ptimer=%p us=%lu repeat=%d\n", (void *)ptimer, (unsigned long)us, (int)repeat);
+#endif
+    int i = timer_slot_find(ptimer);
+    if (i < 0) {
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_arm_us not found ptimer=%p\n", ptimer);
+#endif
+        return;
+    }
+    uint64_t usec = us;
+    if (usec == 0) usec = 1;
+    uint64_t now = espradio_time_us_now();
+    timer_slots[i].active = true;
+    timer_slots[i].periodic = repeat;
+    timer_slots[i].pending_setfn = false;
+    timer_slots[i].interval_us = usec;
+    timer_slots[i].deadline_us = now + usec;
+    if (us == 0) {
+        espradio_timer_fire(ptimer);
+        return;
+    }
+}
+
+int espradio_timer_poll_due(int max_fire) {
+    if (max_fire <= 0) {
+        return 0;
+    }
+    int fired = 0;
+    uint64_t now = espradio_time_us_now();
+    for (unsigned i = 0; i < timer_slots_used; i++) {
+        if (timer_slots[i].active) {
+            continue;
+        }
+        struct ets_timer *t = (struct ets_timer *)timer_slots[i].ptimer;
+        if (!t || !t->func || t->expire == 0) {
+            continue;
+        }
+        uint64_t interval_us = (uint64_t)t->expire * 1000ULL;
+        if (interval_us == 0) {
+            interval_us = 1;
+        }
+        timer_slots[i].active = true;
+        timer_slots[i].periodic = (t->period != 0);
+        timer_slots[i].interval_us = interval_us;
+        timer_slots[i].deadline_us = now + interval_us;
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_poll_due adopt ets_timer idx=%u ptimer=%p expire=%lu period=%lu\n",
+               i, timer_slots[i].ptimer, (unsigned long)t->expire, (unsigned long)t->period);
+#endif
+    }
+    for (int pass = 0; pass < max_fire; pass++) {
+        int idx = -1;
+        for (unsigned i = 0; i < timer_slots_used; i++) {
+            if (timer_slots[i].active && timer_slots[i].deadline_us <= now) {
+                idx = (int)i;
+                break;
+            }
+        }
+        if (idx < 0) {
+            break;
+        }
+        void *ptimer = timer_slots[idx].ptimer;
+#if ESPRADIO_OSI_DEBUG
+        printf("osi: timer_poll_due fire idx=%d ptimer=%p pending=%d active=%d periodic=%d\n",
+               idx, ptimer, 0, (int)timer_slots[idx].active, (int)timer_slots[idx].periodic);
+#endif
+        if (timer_slots[idx].active && timer_slots[idx].periodic) {
+            timer_slots[idx].deadline_us = now + timer_slots[idx].interval_us;
+        }
+        espradio_timer_fire(ptimer);
+        fired++;
+        now = espradio_time_us_now();
+    }
+#if ESPRADIO_OSI_DEBUG
+    if (fired > 0) {
+        printf("osi: timer_poll_due fired=%d used=%u\n", fired, timer_slots_used);
+    }
+#endif
+    return fired;
+}
+
+/* Stub: reset WiFi MAC. Blob calls this at osi+244 between coex_wifi_request and coex_wifi_release;
+ * we set g_wdev_last_desc_reset_ptr so that the *ptr=1 after release does not corrupt memory. */
+static void espradio_wifi_reset_mac(void) {
+    espradio_hal_reset_wifi_mac_go();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_reset_mac\n");
+#endif
+}
+
+static int64_t espradio_esp_timer_get_time(void) {
+    return (int64_t)espradio_time_us_now();
+}
+
+#define ESP_ERR_NVS_BASE        0x1100
+#define ESP_ERR_NVS_NOT_FOUND   (ESP_ERR_NVS_BASE + 0x02)
+
+static int espradio_nvs_set_i8(uint32_t handle, const char* key, int8_t value) {
+    (void)handle;
+    (void)key;
+    (void)value;
+    return 0;
+}
+
+static int espradio_nvs_get_i8(uint32_t handle, const char* key, int8_t* out_value) {
+    (void)handle;
+    (void)key;
+    (void)out_value;
+    return ESP_ERR_NVS_NOT_FOUND;
+}
+
+static int espradio_nvs_set_u8(uint32_t handle, const char* key, uint8_t value) {
+    (void)handle;
+    (void)key;
+    (void)value;
+    return 0;
+}
+
+static int espradio_nvs_get_u8(uint32_t handle, const char* key, uint8_t* out_value) {
+    (void)handle;
+    (void)key;
+    (void)out_value;
+    return ESP_ERR_NVS_NOT_FOUND;
+}
+
+static int espradio_nvs_set_u16(uint32_t handle, const char* key, uint16_t value) {
+    (void)handle;
+    (void)key;
+    (void)value;
+    return 0;
+}
+
+static int espradio_nvs_get_u16(uint32_t handle, const char* key, uint16_t* out_value) {
+    (void)handle;
+    (void)key;
+    (void)out_value;
+    return ESP_ERR_NVS_NOT_FOUND;
+}
+
+static int espradio_nvs_open(const char* name, unsigned int open_mode, uint32_t *out_handle) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: nvs_open name=%s mode=%u\n", name ? name : "(null)", open_mode);
+#endif
+    (void)name;
+    (void)open_mode;
+    if (!out_handle) return -1;
+    *out_handle = 1;
+    return 0;
+}
+
+static void espradio_nvs_close(uint32_t handle) {
+    (void)handle;
+}
+
+static int espradio_nvs_commit(uint32_t handle) {
+    (void)handle;
+    return 0;
+}
+
+static int espradio_nvs_set_blob(uint32_t handle, const char* key, const void* value, size_t length) {
+    (void)handle;
+    (void)key;
+    (void)value;
+    (void)length;
+    return 0;
+}
+
+static int espradio_nvs_get_blob(uint32_t handle, const char* key, void* out_value, size_t* length) {
+    (void)handle;
+    (void)key;
+    (void)out_value;
+    (void)length;
+    return ESP_ERR_NVS_NOT_FOUND;
+}
+
+static int espradio_nvs_erase_key(uint32_t handle, const char* key) {
+    (void)handle;
+    (void)key;
+    return 0;
+}
+
+static int espradio_get_random(uint8_t *buf, size_t len) {
+    if (!buf) {
+        return -1;
+    }
+    size_t i = 0;
+    while (i < len) {
+        uint32_t r = espradio_rand();
+        for (unsigned j = 0; j < 4 && i < len; j++, i++) {
+            buf[i] = (uint8_t)(r >> (j * 8));
+        }
+    }
+    return 0;
+}
+
+static int espradio_get_time(void *t) {
+    if (!t) {
+        return -1;
+    }
+    struct espradio_os_time {
+        int32_t sec;
+        int32_t usec;
+    };
+    uint64_t us = espradio_time_us_now();
+    struct espradio_os_time *ot = (struct espradio_os_time *)t;
+    ot->sec = (int32_t)(us / 1000000ULL);
+    ot->usec = (int32_t)(us % 1000000ULL);
+    return 0;
+}
+
+static unsigned long espradio_random(void) {
+    return (unsigned long)espradio_rand();
+}
+
+static uint32_t espradio_slowclk_cal_get(void) {
+    return 28639;
+}
+
+#define LOG_MSG_MAX 384
+
+#if CONFIG_IDF_TARGET_ESP32
+/* Direct UART0 TX with FIFO drain — putchar/printf varargs are unreliable on
+ * the ESP32 Xtensa cgo path, and putchar buffering can stall.  This writes
+ * straight to the UART0 FIFO and waits for it to drain. */
+static void espradio_uart_putc(char c) {
+    volatile uint32_t *fifo = (volatile uint32_t *)0x3FF40000;
+    volatile uint32_t *status = (volatile uint32_t *)0x3FF4001C;
+    *fifo = (uint32_t)(unsigned char)c;
+    while (((*status >> 16) & 0xFF) != 0) {
+        /* wait for TX FIFO to drain */
+    }
+}
+#define ESPRADIO_PUTC(c) espradio_uart_putc(c)
+#else
+#define ESPRADIO_PUTC(c) putchar(c)
+#endif
+
+static void espradio_log_writev(unsigned int level, const char* tag, const char* format, va_list args) {
+    static char buf[LOG_MSG_MAX];
+    int n = vsnprintf(buf, sizeof(buf), format, args);
+    if (n > 0) {
+        if ((size_t)n >= sizeof(buf)) {
+            buf[sizeof(buf)-1] = '\0';
+        }
+        /* Emit via putchar (no printf varargs — those are unreliable on the
+         * Xtensa cgo path). vsnprintf above uses va_list which is fine. */
+        const char *p;
+        for (p = "[wifi]"; *p; p++) ESPRADIO_PUTC(*p);
+        if (tag && tag[0]) {
+            ESPRADIO_PUTC('[');
+            for (p = tag; *p; p++) ESPRADIO_PUTC(*p);
+            ESPRADIO_PUTC(']');
+        }
+        ESPRADIO_PUTC(' ');
+        for (p = buf; *p; p++) ESPRADIO_PUTC(*p);
+        ESPRADIO_PUTC('\n');
+    }
+}
+
+static void espradio_log_write(unsigned int level, const char* tag, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    espradio_log_writev(level, tag, format, args);
+    va_end(args);
+}
+
+uint32_t espradio_log_timestamp(void);
+
+static void * espradio_malloc_internal(size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_alloc(size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: malloc_internal %zu -> %p (caller=%p)\n", size, ret, __builtin_return_address(0));
+    fflush(stdout);
+#endif
+    return ret;
+}
+
+static void * espradio_realloc_internal(void *ptr, size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_realloc(ptr, size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: realloc_internal %p %zu -> %p\n", ptr, size, ret);
+#endif
+    return ret;
+}
+
+static void * espradio_calloc_internal(size_t n, size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_calloc(n, size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: calloc_internal %zu*%zu -> %p\n", n, size, ret);
+#endif
+    return ret;
+}
+
+static void * espradio_zalloc_internal(size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_calloc(1, size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: zalloc_internal %zu -> %p (caller=%p)\n", size, ret, __builtin_return_address(0));
+#endif
+    return ret;
+}
+
+static void * espradio_wifi_malloc(size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_alloc(size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_malloc %zu -> %p\n", size, ret);
+#endif
+    return ret;
+}
+
+static void * espradio_wifi_realloc(void *ptr, size_t size) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_realloc %p %zu\n", (void *)ptr, size);
+#endif
+    espradio_alloc_count++;
+    return espradio_arena_realloc(ptr, size);
+}
+
+static void * espradio_wifi_calloc(size_t n, size_t size) {
+    espradio_alloc_count++;
+    void *ret = espradio_arena_calloc(n, size);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_calloc n=%zu size=%zu -> %p\n", n, size, ret);
+#endif
+    return ret;
+}
+
+static void * espradio_wifi_zalloc(size_t size) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_zalloc %zu (caller=%p)", size, __builtin_return_address(0));
+#endif
+    espradio_alloc_count++;
+    void *ret = espradio_arena_calloc(1, size);
+#if ESPRADIO_OSI_DEBUG
+    printf(" -> %p\n", ret);
+    fflush(stdout);
+#endif
+    return ret;
+}
+
+void espradio_arena_stats(uint32_t *used, uint32_t *capacity);
+
+void espradio_alloc_stats(unsigned *out_alloc, unsigned *out_free) {
+    if (out_alloc) *out_alloc = espradio_alloc_count;
+    if (out_free) *out_free = espradio_free_count;
+}
+
+void *pvPortMalloc(size_t size) {
+    espradio_alloc_count++;
+    return espradio_arena_alloc(size);
+}
+void vPortFree(void *p) {
+    if (p) espradio_free_count++;
+    espradio_arena_free(p);
+}
+
+void * espradio_wifi_create_queue(int queue_len, int item_size);
+
+void espradio_wifi_delete_queue(void * queue);
+
+/* -------------------------------------------------------------------------
+ * Coex stubs — WiFi-only, no Bluetooth coexistence needed.
+ *
+ * Many libcoexist.a functions (even those in flash) internally call ROM
+ * trampoline functions (coex_schm_lock, coex_schm_unlock, coex_core_request,
+ * etc.) whose implementation pointers in DRAM are never fully initialized.
+ * Calling any of them crashes with pc:nil.
+ *
+ * We replace ALL coex entries in the wifi_osi_funcs_t table with safe stubs
+ * that never touch libcoexist or ROM code.
+ * ----------------------------------------------------------------------- */
+
+static int espradio_coex_init(void) { return 0; }
+static void espradio_coex_deinit(void) {}
+static int espradio_coex_enable(void) { return 0; }
+static void espradio_coex_disable(void) {}
+
+static uint32_t espradio_coex_status_get(void) { return 0; }
+
+static void espradio_coex_condition_set(uint32_t type, bool dissatisfy) {
+    (void)type; (void)dissatisfy;
+}
+
+static int espradio_coex_wifi_request(uint32_t event, uint32_t latency, uint32_t duration) {
+    (void)event; (void)latency; (void)duration;
+    return 0;
+}
+
+static int espradio_coex_wifi_release(uint32_t event) {
+    (void)event; return 0;
+}
+
+static int espradio_coex_wifi_channel_set(uint8_t primary, uint8_t secondary) {
+    (void)primary; (void)secondary;
+    return 0;
+}
+
+static int espradio_coex_event_duration_get(uint32_t event, uint32_t *duration) {
+    (void)event;
+    if (duration) *duration = 0;
+    return 0;
+}
+
+static int espradio_coex_pti_get(uint32_t event, uint8_t *pti) {
+    (void)event;
+    if (pti) *pti = 0;
+    return 0;
+}
+
+static void espradio_coex_schm_status_bit_clear(uint32_t type, uint32_t status) {
+    (void)type; (void)status;
+}
+
+static void espradio_coex_schm_status_bit_set(uint32_t type, uint32_t status) {
+    (void)type; (void)status;
+}
+
+static int espradio_coex_schm_interval_set(uint32_t interval) {
+    (void)interval; return 0;
+}
+
+static uint32_t espradio_coex_schm_interval_get(void) { return 0; }
+static uint8_t espradio_coex_schm_curr_period_get(void) { return 0; }
+static void *espradio_coex_schm_curr_phase_get(void) { return NULL; }
+static int espradio_coex_schm_process_restart(void) { return 0; }
+
+static int espradio_coex_schm_register_cb(int type, int (*cb)(int)) {
+    (void)type; (void)cb;
+    return 0;
+}
+
+static int espradio_coex_register_start_cb(int (*cb)(void)) {
+    (void)cb; return 0;
+}
+
+static int espradio_coex_schm_flexible_period_set(uint8_t period) {
+    (void)period; return 0;
+}
+
+static uint8_t espradio_coex_schm_flexible_period_get(void) { return 0; }
+
+static void *espradio_coex_schm_get_phase_by_idx(int idx) {
+    (void)idx; return NULL;
+}
+
+/* Coexistence adapter (esp_coexist_adapter.h) ********************************************/
+
+/* Adapter wrappers with logging; most of them delegate to existing OSI functions. */
+static void espradio_coex_adapter_task_yield_from_isr(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: task_yield_from_isr\n");
+#endif
+}
+
+static void *espradio_coex_adapter_semphr_create(uint32_t max, uint32_t init) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_create max=%lu init=%lu\n",
+           (unsigned long)max, (unsigned long)init);
+#endif
+    return espradio_semphr_create(max, init);
+}
+
+static void espradio_coex_adapter_semphr_delete(void *semphr) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_delete %p\n", semphr);
+#endif
+    espradio_semphr_delete(semphr);
+}
+
+static int32_t espradio_coex_adapter_semphr_take_from_isr(void *semphr, void *hptw) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_take_from_isr sem=%p hptw=%p\n", semphr, hptw);
+#endif
+    /* Treat as non-blocking take. */
+    return espradio_semphr_take(semphr, 0);
+}
+
+static int32_t espradio_coex_adapter_semphr_give_from_isr(void *semphr, void *hptw) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_give_from_isr sem=%p hptw=%p\n", semphr, hptw);
+#endif
+    return espradio_semphr_give(semphr);
+}
+
+static int32_t espradio_coex_adapter_semphr_take(void *semphr, uint32_t block_time_tick) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_take sem=%p block=%lu\n",
+           semphr, (unsigned long)block_time_tick);
+#endif
+    return espradio_semphr_take(semphr, block_time_tick);
+}
+
+static int32_t espradio_coex_adapter_semphr_give(void *semphr) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: semphr_give sem=%p\n", semphr);
+#endif
+    return espradio_semphr_give(semphr);
+}
+
+static int espradio_coex_adapter_is_in_isr(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: is_in_isr\n");
+#endif
+    return 0;
+}
+
+static void *espradio_coex_adapter_malloc_internal(size_t size) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: malloc_internal size=%lu\n", (unsigned long)size);
+#endif
+    return espradio_malloc_internal(size);
+}
+
+static void espradio_coex_adapter_free(void *p) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: free %p\n", p);
+#endif
+    espradio_free(p);
+}
+
+static int64_t espradio_coex_adapter_esp_timer_get_time(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: esp_timer_get_time\n");
+#endif
+    return (int64_t)espradio_time_us_now();
+}
+
+static bool espradio_coex_adapter_env_is_chip(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: env_is_chip\n");
+#endif
+    return espradio_env_is_chip();
+}
+
+static void espradio_coex_adapter_timer_disarm(void *timer) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: timer_disarm %p\n", timer);
+#endif
+    espradio_timer_disarm(timer);
+}
+
+static void espradio_coex_adapter_timer_done(void *ptimer) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: timer_done %p\n", ptimer);
+#endif
+    espradio_timer_done(ptimer);
+}
+
+static void espradio_coex_adapter_timer_setfn(void *ptimer, void *pfunction, void *parg) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: timer_setfn ptimer=%p fn=%p arg=%p\n",
+           ptimer, pfunction, parg);
+#endif
+    espradio_timer_setfn(ptimer, pfunction, parg);
+}
+
+static void espradio_coex_adapter_timer_arm_us(void *ptimer, uint32_t us, bool repeat) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: timer_arm_us ptimer=%p us=%lu repeat=%d\n",
+           ptimer, (unsigned long)us, (int)repeat);
+#endif
+    espradio_timer_arm_us(ptimer, us, repeat);
+}
+
+static int espradio_coex_adapter_debug_matrix_init(int event, int signal, bool rev) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: debug_matrix_init event=%d signal=%d rev=%d\n",
+           event, signal, (int)rev);
+#endif
+    return 0;
+}
+
+static int espradio_coex_adapter_xtal_freq_get(void) {
+#if ESPRADIO_OSI_DEBUG
+    printf("coex_adapter: xtal_freq_get\n");
+#endif
+    return 40; /* Typical crystal frequency in MHz. */
+}
+
+coex_adapter_funcs_t g_coex_adapter_funcs = {
+    ._version = COEX_ADAPTER_VERSION,
+#if CONFIG_IDF_TARGET_ESP32
+    ._spin_lock_create = espradio_spin_lock_create,
+    ._spin_lock_delete = espradio_spin_lock_delete,
+    ._int_disable = espradio_wifi_int_disable,
+    ._int_enable = espradio_wifi_int_restore,
+#endif
+    ._task_yield_from_isr = espradio_coex_adapter_task_yield_from_isr,
+    ._semphr_create = espradio_coex_adapter_semphr_create,
+    ._semphr_delete = espradio_coex_adapter_semphr_delete,
+    ._semphr_take_from_isr = espradio_coex_adapter_semphr_take_from_isr,
+    ._semphr_give_from_isr = espradio_coex_adapter_semphr_give_from_isr,
+    ._semphr_take = espradio_coex_adapter_semphr_take,
+    ._semphr_give = espradio_coex_adapter_semphr_give,
+    ._is_in_isr = espradio_coex_adapter_is_in_isr,
+    ._malloc_internal = espradio_coex_adapter_malloc_internal,
+    ._free = espradio_coex_adapter_free,
+    ._esp_timer_get_time = espradio_coex_adapter_esp_timer_get_time,
+    ._env_is_chip = espradio_coex_adapter_env_is_chip,
+    ._timer_disarm = espradio_coex_adapter_timer_disarm,
+    ._timer_done = espradio_coex_adapter_timer_done,
+    ._timer_setfn = espradio_coex_adapter_timer_setfn,
+    ._timer_arm_us = espradio_coex_adapter_timer_arm_us,
+    ._debug_matrix_init = espradio_coex_adapter_debug_matrix_init,
+    ._xtal_freq_get = espradio_coex_adapter_xtal_freq_get,
+    ._magic = COEX_ADAPTER_MAGIC,
+};
+
+extern esp_err_t esp_coex_adapter_register(coex_adapter_funcs_t *funcs);
+
+void espradio_coex_adapter_init(void) {
+    esp_err_t r = esp_coex_adapter_register(&g_coex_adapter_funcs);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: esp_coex_adapter_register -> %ld\n", (long)r);
+    /* Dump adapter table to verify struct layout */
+    {
+        uint32_t *p = (uint32_t *)&g_coex_adapter_funcs;
+        int n = sizeof(g_coex_adapter_funcs) / sizeof(uint32_t);
+        printf("osi: coex_adapter_funcs @ %p (%d words):\n", (void*)p, n);
+        for (int i = 0; i < n && i < 24; i++) {
+            printf("  [%2d] offset %3d = 0x%08lx\n", i, i*4, (unsigned long)p[i]);
+        }
+    }
+#endif
+}
+
+
+/* Debug wrappers for wifi OSI semphr/queue functions */
+static void *espradio_dbg_wifi_thread_semphr_get(void) {
+    void *ret = espradio_wifi_thread_semphr_get();
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: wifi_thread_semphr_get -> %p\n", ret);
+#endif
+    return ret;
+}
+
+static int32_t espradio_dbg_semphr_take(void *semphr, uint32_t block_time_tick) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: semphr_take sem=%p block=%lu\n", semphr, (unsigned long)block_time_tick);
+#endif
+    int32_t ret = espradio_semphr_take(semphr, block_time_tick);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: semphr_take -> %ld\n", (long)ret);
+#endif
+    return ret;
+}
+
+static int32_t espradio_dbg_semphr_give(void *semphr) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: semphr_give sem=%p\n", semphr);
+#endif
+    int32_t ret = espradio_semphr_give(semphr);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: semphr_give -> %ld\n", (long)ret);
+#endif
+    return ret;
+}
+
+static int32_t espradio_dbg_queue_recv(void *ptr, void *item, uint32_t block_time_tick) {
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_recv q=%p block=%lu\n", ptr, (unsigned long)block_time_tick);
+#endif
+    int32_t ret = espradio_queue_recv(ptr, item, block_time_tick);
+#if ESPRADIO_OSI_DEBUG
+    printf("osi: queue_recv -> %ld\n", (long)ret);
+#endif
+    return ret;
+}
+
+wifi_osi_funcs_t espradio_osi_funcs = {
+    ._version = ESP_WIFI_OS_ADAPTER_VERSION,
+    ._env_is_chip = espradio_env_is_chip,
+    ._set_intr = espradio_set_intr,
+    ._clear_intr = espradio_clear_intr,
+    ._set_isr = espradio_set_isr,
+    ._ints_on = espradio_ints_on,
+    ._ints_off = espradio_ints_off,
+    ._is_from_isr = espradio_is_from_isr,
+    ._spin_lock_create = espradio_spin_lock_create,
+    ._spin_lock_delete = espradio_spin_lock_delete,
+    ._wifi_int_disable = espradio_wifi_int_disable,
+    ._wifi_int_restore = espradio_wifi_int_restore,
+    ._task_yield_from_isr = espradio_task_yield_from_isr,
+    ._semphr_create = espradio_semphr_create,
+    ._semphr_delete = espradio_semphr_delete,
+    ._semphr_take = espradio_dbg_semphr_take,
+    ._semphr_give = espradio_dbg_semphr_give,
+    ._wifi_thread_semphr_get = espradio_dbg_wifi_thread_semphr_get,
+    ._mutex_create = espradio_mutex_create,
+    ._recursive_mutex_create = espradio_recursive_mutex_create,
+    ._mutex_delete = espradio_mutex_delete,
+    ._mutex_lock = espradio_mutex_lock,
+    ._mutex_unlock = espradio_mutex_unlock,
+    ._queue_create = espradio_queue_create,
+    ._queue_delete = espradio_queue_delete,
+    ._queue_send = espradio_queue_send,
+    ._queue_send_from_isr = espradio_queue_send_from_isr,
+    ._queue_send_to_back = espradio_queue_send_to_back,
+    ._queue_send_to_front = espradio_queue_send_to_front,
+    ._queue_recv = espradio_dbg_queue_recv,
+    ._queue_msg_waiting = espradio_queue_msg_waiting,
+    ._event_group_create = espradio_event_group_create,
+    ._event_group_delete = espradio_event_group_delete,
+    ._event_group_set_bits = espradio_event_group_set_bits,
+    ._event_group_clear_bits = espradio_event_group_clear_bits,
+    ._event_group_wait_bits = espradio_event_group_wait_bits,
+    ._task_create_pinned_to_core = espradio_task_create_pinned_to_core,
+    ._task_create = espradio_task_create,
+    ._task_delete = espradio_task_delete,
+    ._task_delay = espradio_task_delay,
+    ._task_ms_to_tick = espradio_task_ms_to_tick,
+    ._task_get_current_task = espradio_task_get_current_task,
+    ._task_get_max_priority = espradio_task_get_max_priority,
+    ._malloc = espradio_malloc,
+    ._free = espradio_free,
+    ._event_post = (int32_t (*)(const char *, int32_t, void *, size_t, uint32_t))esp_event_post,
+    ._get_free_heap_size = espradio_get_free_heap_size,
+    ._rand = espradio_rand,
+    ._dport_access_stall_other_cpu_start_wrap = espradio_dport_access_stall_other_cpu_start_wrap,
+    ._dport_access_stall_other_cpu_end_wrap = espradio_dport_access_stall_other_cpu_end_wrap,
+    ._wifi_apb80m_request = espradio_wifi_apb80m_request,
+    ._wifi_apb80m_release = espradio_wifi_apb80m_release,
+    ._phy_disable = espradio_phy_disable,
+    ._phy_enable = espradio_phy_enable,
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_ESP_WIFI_TARGET_ESP32
+    ._phy_common_clock_enable = esp_phy_common_clock_enable,
+    ._phy_common_clock_disable = esp_phy_common_clock_disable,
+#endif
+    ._phy_update_country_info = espradio_phy_update_country_info,
+    ._read_mac = espradio_read_mac,
+    ._timer_arm = espradio_timer_arm,
+    ._timer_disarm = espradio_timer_disarm,
+    ._timer_done = espradio_timer_done,
+    ._timer_setfn = espradio_timer_setfn,
+    ._timer_arm_us = espradio_timer_arm_us,
+    ._wifi_reset_mac = espradio_wifi_reset_mac,
+    ._wifi_clock_enable = espradio_wifi_clock_enable_noop,
+    ._wifi_clock_disable = espradio_wifi_clock_disable_noop,
+    ._wifi_rtc_enable_iso = espradio_wifi_rtc_enable_iso_noop,
+    ._wifi_rtc_disable_iso = espradio_wifi_rtc_disable_iso_noop,
+    ._esp_timer_get_time = espradio_esp_timer_get_time,
+    ._nvs_set_i8 = espradio_nvs_set_i8,
+    ._nvs_get_i8 = espradio_nvs_get_i8,
+    ._nvs_set_u8 = espradio_nvs_set_u8,
+    ._nvs_get_u8 = espradio_nvs_get_u8,
+    ._nvs_set_u16 = espradio_nvs_set_u16,
+    ._nvs_get_u16 = espradio_nvs_get_u16,
+    ._nvs_open = espradio_nvs_open,
+    ._nvs_close = espradio_nvs_close,
+    ._nvs_commit = espradio_nvs_commit,
+    ._nvs_set_blob = espradio_nvs_set_blob,
+    ._nvs_get_blob = espradio_nvs_get_blob,
+    ._nvs_erase_key = espradio_nvs_erase_key,
+    ._get_random = espradio_get_random,
+    ._get_time = espradio_get_time,
+    ._random = espradio_random,
+#if !CONFIG_IDF_TARGET_ESP32 && !CONFIG_ESP_WIFI_TARGET_ESP32
+    ._slowclk_cal_get = espradio_slowclk_cal_get,
+#endif
+    ._log_write = espradio_log_write,
+    ._log_writev = espradio_log_writev,
+    ._log_timestamp = espradio_log_timestamp,
+    ._malloc_internal = espradio_malloc_internal,
+    ._realloc_internal = espradio_realloc_internal,
+    ._calloc_internal = espradio_calloc_internal,
+    ._zalloc_internal = espradio_zalloc_internal,
+    ._wifi_malloc = espradio_wifi_malloc,
+    ._wifi_realloc = espradio_wifi_realloc,
+    ._wifi_calloc = espradio_wifi_calloc,
+    ._wifi_zalloc = espradio_wifi_zalloc,
+    ._wifi_create_queue = espradio_wifi_create_queue,
+    ._wifi_delete_queue = espradio_wifi_delete_queue,
+    ._coex_init = espradio_coex_init,
+    ._coex_deinit = espradio_coex_deinit,
+    ._coex_enable = espradio_coex_enable,
+    ._coex_disable = espradio_coex_disable,
+    ._coex_status_get = espradio_coex_status_get,
+    ._coex_condition_set = espradio_coex_condition_set,
+    ._coex_wifi_request = espradio_coex_wifi_request,
+    ._coex_wifi_release = espradio_coex_wifi_release,
+    ._coex_wifi_channel_set = espradio_coex_wifi_channel_set,
+    ._coex_event_duration_get = espradio_coex_event_duration_get,
+    ._coex_pti_get = espradio_coex_pti_get,
+    ._coex_schm_status_bit_clear = espradio_coex_schm_status_bit_clear,
+    ._coex_schm_status_bit_set = espradio_coex_schm_status_bit_set,
+    ._coex_schm_interval_set = espradio_coex_schm_interval_set,
+    ._coex_schm_interval_get = espradio_coex_schm_interval_get,
+    ._coex_schm_curr_period_get = espradio_coex_schm_curr_period_get,
+    ._coex_schm_curr_phase_get = espradio_coex_schm_curr_phase_get,
+    ._coex_schm_process_restart = espradio_coex_schm_process_restart,
+    ._coex_schm_register_cb = espradio_coex_schm_register_cb,
+    ._coex_register_start_cb = espradio_coex_register_start_cb,
+    ._coex_schm_flexible_period_set = espradio_coex_schm_flexible_period_set,
+    ._coex_schm_flexible_period_get = espradio_coex_schm_flexible_period_get,
+    ._coex_schm_get_phase_by_idx = espradio_coex_schm_get_phase_by_idx,
+    ._magic = ESP_WIFI_OS_ADAPTER_MAGIC,
+};
