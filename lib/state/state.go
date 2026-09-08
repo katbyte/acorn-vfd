@@ -1,6 +1,6 @@
-// Package state remembers the address of the last device acornvfd connected to. The clock advertises its name
+// Package state remembers the address of the last clock acornvfd connected to. The clock advertises its name
 // only intermittently, so name matching is unreliable; its address is stable per host, and reconnecting by the
-// remembered address lets `acornvfd sync-time` and friends run without flags after the first connection.
+// remembered address lets `acornvfd time` and friends run without flags after the first connection.
 package state
 
 import (
@@ -28,8 +28,8 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "acornvfd", "device.json"), nil
 }
 
-// Load reads the state file at path ("" = DefaultPath). A missing file yields an empty State.
-func Load(path string) (*State, error) {
+// New returns an empty State that Save writes to path ("" = DefaultPath), without reading anything.
+func New(path string) (*State, error) {
 	if path == "" {
 		var err error
 		if path, err = DefaultPath(); err != nil {
@@ -37,17 +37,25 @@ func Load(path string) (*State, error) {
 		}
 	}
 
-	s := &State{path: path}
+	return &State{path: path}, nil
+}
 
-	b, err := os.ReadFile(path) //nolint:gosec // G304: the path is the user's own config file
+// Load reads the state file at path ("" = DefaultPath). A missing file yields an empty State.
+func Load(path string) (*State, error) {
+	s, err := New(path)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return s, nil
 		}
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, fmt.Errorf("reading %s: %w", s.path, err)
 	}
 	if err := json.Unmarshal(b, s); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
+		return nil, fmt.Errorf("parsing %s: %w", s.path, err)
 	}
 
 	return s, nil

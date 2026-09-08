@@ -5,24 +5,19 @@ package main
 import (
 	"os"
 
-	c "github.com/gookit/color"
 	"github.com/katbyte/acornvfd/cli"
-	"github.com/katbyte/acornvfd/lib/clog"
+	"github.com/katbyte/acornvfd/lib/cout"
 )
 
 func main() {
 	cmd, err := cli.Make()
 	if err != nil {
-		clog.Log.Error(c.Sprintf("<red>acornvfd: building cmd</> %v", err))
-
+		cout.Errorf("<red>acornvfd: building cmd:</> %v\n", err)
 		os.Exit(1)
 	}
 
 	if err := cmd.Execute(); err != nil {
-		clog.Log.Error(c.Sprintf("<red>acornvfd:</> %v", err))
-
+		cout.Errorf("<red>acornvfd:</> %v\n", err)
 		os.Exit(1)
 	}
-
-	os.Exit(0)
 }

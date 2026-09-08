@@ -52,7 +52,7 @@ func TestParseHex(t *testing.T) {
 		{name: "eight valid bytes", in: "ff0101 0f 17 0000d9", want: "FF 01 01 0F 17 00 00 D9"},
 		{name: "0x prefixes and commas", in: "0xFF,0x01,0x01,0x0F,0x17,0x00,0x00", want: "FF 01 01 0F 17 00 00 D9"},
 		{name: "bad checksum", in: "FF 01 01 0F 17 00 00 00", wantErr: true},
-		{name: "bad header", in: "FE 01 01 0F 17 00 00", wantErr: false}, // header is not enforced on 7-byte input
+		{name: "bad header", in: "FE 01 01 0F 17 00 00", wantErr: true},
 		{name: "wrong length", in: "FF 01", wantErr: true},
 		{name: "odd digits", in: "FF 0", wantErr: true},
 		{name: "not hex", in: "FF ZZ 01 0F 17 00 00", wantErr: true},
@@ -130,8 +130,11 @@ func TestClockValidation(t *testing.T) {
 	if _, err := xggf.SetDate(time.Date(1999, 12, 31, 0, 0, 0, 0, time.UTC)); err == nil {
 		t.Fatal("expected year < 2000 to fail")
 	}
-	if _, err := xggf.SetDate(time.Date(2556, 1, 1, 0, 0, 0, 0, time.UTC)); err == nil {
-		t.Fatal("expected year > 2555 to fail")
+	if _, err := xggf.SetDate(time.Date(xggf.YearMax, 12, 31, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("expected year %d to be accepted: %v", xggf.YearMax, err)
+	}
+	if _, err := xggf.SetDate(time.Date(xggf.YearMax+1, 1, 1, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatalf("expected year %d to fail (year-2000 must fit one byte)", xggf.YearMax+1)
 	}
 	if _, err := xggf.Brightness(8); err == nil {
 		t.Fatal("expected brightness 8 to fail")

@@ -24,6 +24,9 @@ type FlagData struct {
 	Quiet      bool   `mapstructure:"quiet"`
 	Silent     bool   `mapstructure:"silent"`
 	Uncoloured bool   `mapstructure:"uncoloured"`
+
+	// noRemember stops a connection from being written to the state file (set for lamp commands).
+	noRemember bool
 }
 
 // FlagsDevice selects which device to talk to and which characteristics to use.
@@ -134,7 +137,10 @@ const DefaultName = "XGGF-1V48"
 func (f *FlagData) BLEOptions() ble.Options {
 	address := f.Device.Address
 	if address == "" && f.Device.Name == DefaultName {
-		if st, err := state.Load(f.StateFile); err == nil && st.Address != "" {
+		switch st, err := state.Load(f.StateFile); {
+		case err != nil:
+			cout.Verbosef("<yellow>warning:</> %v; scanning by name instead\n", err)
+		case st.Address != "":
 			address = st.Address
 			cout.Verbosef("<gray>using remembered address %s (%s); pass --address or --name to override</>\n", address, st.Device)
 		}

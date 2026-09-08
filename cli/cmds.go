@@ -31,10 +31,11 @@ vendor's Android app; see PROTOCOL.md for the packet format and what is verified
 Devices are found by scanning for their advertised name (default prefix XGGF-1V48) or by --address.
 Every command that talks to the device accepts --dry-run to print the packets instead of sending them.`,
 		SilenceErrors: true,
-		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			switch {
 			case viper.GetBool("silent"):
 				cout.Level = cout.VerbositySilent
+				cmd.SilenceUsage = true
 			case viper.GetBool("quiet"):
 				cout.Level = cout.VerbosityQuiet
 			case viper.GetBool("verbose"):
@@ -140,7 +141,7 @@ func dumpCmd() *cobra.Command {
 		Use:   "dump",
 		Short: "connect and list every GATT service and characteristic on the device",
 		Long: `Connects to the device and prints every service and characteristic, reading each value where the
-device allows it. Use this to confirm the Nordic UART UUIDs from PROTOCOL.md before trusting sync-time.`,
+device allows it. Use this to confirm the Nordic UART UUIDs from PROTOCOL.md before trusting the time command.`,
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -151,7 +152,15 @@ device allows it. Use this to confirm the Nordic UART UUIDs from PROTOCOL.md bef
 				return err
 			}
 
-			return ble.Dump(f.BLEOptions(), cout.Writer())
+			conn, err := f.open()
+			if err != nil {
+				return err
+			}
+			defer closeConn(conn)
+
+			conn.Dump(cout.Writer())
+
+			return nil
 		},
 	}
 }
@@ -166,9 +175,9 @@ func listenCmd() *cobra.Command {
 		Use:   "listen",
 		Short: "subscribe to the notify characteristic and print anything the device sends",
 		Long: `Connects, enables notifications on the UART TX characteristic (or --notify-char) and prints every
-value received until --duration elapses or Ctrl-C. The vendor app never listens to the clock, so this is
-how to find out whether the device talks back at all. --send writes packets while listening, so a reply to a
-specific command is caught in the same connection.`,
+value received until --duration elapses (0 = until Ctrl-C) or Ctrl-C. The vendor app never listens to the clock,
+so this is how to find out whether the device talks back at all. --send writes packets while listening, so a
+reply to a specific command is caught in the same connection. With --dry-run the --send packets are only printed.`,
 		Example:       "  acornvfd listen --duration 20s --send 'FF 05 04 01 00 00 00' --send 'FF 05 04 00 00 00 00'",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
@@ -180,52 +189,78 @@ specific command is caught in the same connection.`,
 				return err
 			}
 
-			conn, err := ble.Connect(f.BLEOptions())
+			// parse every --send up front so a typo fails before we touch the radio; date/time are built at send time
+			var probes []func() (xggf.Packet, error)
+			for _, hexText := range sends {
+				switch strings.ToLower(hexText) {
+				case "date":
+					probes = append(probes, func() (xggf.Packet, error) { return xggf.SetDate(time.Now()) })
+				case "time":
+					probes = append(probes, func() (xggf.Packet, error) { return xggf.SetTime(time.Now()), nil })
+				default:
+					p, perr := xggf.ParseHex(hexText)
+					if perr != nil {
+						return fmt.Errorf("--send %q: %w", hexText, perr)
+					}
+					probes = append(probes, func() (xggf.Packet, error) { return p, nil })
+				}
+			}
+
+			if f.Send.DryRun {
+				return f.withSender(func(s *sender) error {
+					for _, build := range probes {
+						p, perr := build()
+						if perr != nil {
+							return perr
+						}
+						if err := s.Packet(lp(p)); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+			}
+
+			conn, err := f.connect()
 			if err != nil {
 				return err
 			}
-			defer func() { _ = conn.Close() }()
+			defer closeConn(conn)
 
 			if err := conn.Listen(func(b []byte) {
-				cout.Quietf("<gray>%s</> <cyan>% X</>  %q\n", time.Now().Format("15:04:05.000"), b, printable(b))
+				cout.Quietf("<gray>%s</> <cyan>% X</>  %q\n", time.Now().Format("15:04:05.000"), b, ble.Printable(b))
 			}); err != nil {
 				return err
 			}
 
-			cout.Printf("listening on <cyan>%s</> for <yellow>%s</> (Ctrl-C to stop)...\n", conn.NotifyUUID(), duration)
+			if duration > 0 {
+				cout.Printf("listening on <cyan>%s</> for <yellow>%s</> (Ctrl-C to stop)...\n", conn.NotifyUUID(), duration)
+			} else {
+				cout.Printf("listening on <cyan>%s</> (Ctrl-C to stop)...\n", conn.NotifyUUID())
+			}
 
 			sig := make(chan os.Signal, 1)
 			signal.Notify(sig, os.Interrupt)
 			defer signal.Stop(sig)
 
-			deadline := time.After(duration)
+			var deadline <-chan time.Time // nil = never fires
+			if duration > 0 {
+				deadline = time.After(duration)
+			}
 
 			// give the device a moment to volunteer anything, then send the probes with --gap between them
-			if len(sends) > 0 {
+			if len(probes) > 0 {
 				time.Sleep(time.Second)
 			}
-			for i, hexText := range sends {
-				var p xggf.Packet
-				switch strings.ToLower(hexText) {
-				case "date":
-					if p, err = xggf.SetDate(time.Now()); err != nil {
-						return err
-					}
-				case "time":
-					p = xggf.SetTime(time.Now())
-				default:
-					if p, err = xggf.ParseHex(hexText); err != nil {
-						return fmt.Errorf("--send %q: %w", hexText, err)
-					}
+			for i, build := range probes {
+				p, perr := build()
+				if perr != nil {
+					return perr
 				}
 				if i > 0 && f.Send.Gap > 0 {
 					time.Sleep(f.Send.Gap)
 				}
-				label := xggf.Describe(p)
-				if label == "" {
-					label = "send"
-				}
-				cout.Quietf("<gray>%s</> <white>-> %-24s</> <cyan>%s</>\n", time.Now().Format("15:04:05.000"), label, p)
+				cout.Quietf("<gray>%s</> <white>-> %-24s</> <cyan>%s</>\n", time.Now().Format("15:04:05.000"), lp(p).label, p)
 				if err := conn.Write(p.Bytes(), !f.Send.NoResponse); err != nil {
 					return err
 				}
@@ -241,7 +276,7 @@ specific command is caught in the same connection.`,
 		},
 	}
 
-	cmd.Flags().DurationVar(&duration, "duration", 30*time.Second, "how long to listen")
+	cmd.Flags().DurationVar(&duration, "duration", 30*time.Second, "how long to listen (0 = until Ctrl-C)")
 	cmd.Flags().StringArrayVar(&sends, "send", nil, "packet to send after subscribing: hex (7 or 8 bytes), or 'date' / 'time' for a sync packet built at send time; repeatable, sent --gap apart")
 
 	return cmd
@@ -292,16 +327,4 @@ must already carry a correct checksum. --no-checksum sends whatever you typed, u
 	cmd.Flags().BoolVar(&noChecksum, "no-checksum", false, "send the bytes exactly as given, without framing or checksum")
 
 	return cmd
-}
-
-func printable(b []byte) string {
-	var sb strings.Builder
-	for _, ch := range b {
-		if ch >= 0x20 && ch < 0x7f {
-			sb.WriteByte(ch)
-		} else {
-			sb.WriteByte('.')
-		}
-	}
-	return sb.String()
 }

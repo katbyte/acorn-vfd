@@ -31,7 +31,8 @@ func timeCmd() *cobra.Command {
 		Short: "with no argument, sync date and time from this computer; with an argument, set the time",
 		Long: `With no argument, sends the set-date packet followed by the set-time packet using this computer's
 local wall-clock time, exactly as the app's two sync buttons do. The time is read after the connection is up so
-the multi-second scan does not skew it. --date-only / --time-only limit the sync to one of the two.
+the multi-second scan does not skew it, and the time packet is sent on a second boundary so the clock's seconds
+land as close as Bluetooth allows. --date-only / --time-only limit the sync to one of the two.
 
 With an HH:MM[:SS] argument, sets the clock's time to exactly that (24-hour) and nothing else.`,
 		Example:       "  acornvfd time            # sync date + time now\n  acornvfd time 07:30",
@@ -74,8 +75,14 @@ With an HH:MM[:SS] argument, sets the clock's time to exactly that (24-hour) and
 					}
 				}
 				if !dateOnly {
-					// re-read so the seconds are as fresh as possible after the date write and gap
-					if serr := s.Packet(lp(xggf.SetTime(time.Now()))); serr != nil {
+					// the clock takes the seconds from the packet, so wait for the next whole second and send it for
+					// that instant; the write then lands a few tens of ms after the boundary instead of anywhere in it
+					now := time.Now()
+					if !f.Send.DryRun {
+						now = now.Truncate(time.Second).Add(time.Second)
+						time.Sleep(time.Until(now))
+					}
+					if serr := s.Packet(lp(xggf.SetTime(now))); serr != nil {
 						return serr
 					}
 				}
@@ -134,32 +141,7 @@ if the clock seems to ignore the level.`,
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var (
-				p   xggf.Packet
-				err error
-			)
-			switch arg := strings.ToLower(strings.TrimSpace(args[0])); {
-			case arg == "auto":
-				p = xggf.AutoBrightness(true)
-			case arg == "manual":
-				p = xggf.AutoBrightness(false)
-			case strings.HasSuffix(arg, "%"):
-				pct, perr := strconv.Atoi(strings.TrimSuffix(arg, "%"))
-				if perr != nil {
-					return fmt.Errorf("percentage must be a whole number: %w", perr)
-				}
-				level, lerr := xggf.BrightnessFromPercent(pct)
-				if lerr != nil {
-					return lerr
-				}
-				p, err = xggf.Brightness(level)
-			default:
-				level, lerr := strconv.Atoi(arg)
-				if lerr != nil {
-					return fmt.Errorf("brightness must be 0-%d, a percentage, auto or manual", xggf.BrightnessMax)
-				}
-				p, err = xggf.Brightness(level)
-			}
+			p, err := parseBrightness(args[0])
 			if err != nil {
 				return err
 			}
@@ -272,6 +254,32 @@ func toggleCmd(name, what string, build func(bool) xggf.Packet) *cobra.Command {
 
 			return f.sendPackets(lp(build(on)))
 		},
+	}
+}
+
+// parseBrightness turns the brightness argument (0-7, N%, auto or manual) into its packet.
+func parseBrightness(arg string) (xggf.Packet, error) {
+	switch arg = strings.ToLower(strings.TrimSpace(arg)); {
+	case arg == "auto":
+		return xggf.AutoBrightness(true), nil
+	case arg == "manual":
+		return xggf.AutoBrightness(false), nil
+	case strings.HasSuffix(arg, "%"):
+		pct, err := strconv.Atoi(strings.TrimSuffix(arg, "%"))
+		if err != nil {
+			return xggf.Packet{}, fmt.Errorf("percentage must be a whole number: %w", err)
+		}
+		level, err := xggf.BrightnessFromPercent(pct)
+		if err != nil {
+			return xggf.Packet{}, err
+		}
+		return xggf.Brightness(level)
+	default:
+		level, err := strconv.Atoi(arg)
+		if err != nil {
+			return xggf.Packet{}, fmt.Errorf("brightness must be 0-%d, a percentage, auto or manual, got %q", xggf.BrightnessMax, arg)
+		}
+		return xggf.Brightness(level)
 	}
 }
 

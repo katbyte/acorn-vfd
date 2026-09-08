@@ -57,15 +57,12 @@ func (p Packet) Valid() bool {
 
 // String renders the packet as space-separated upper-case hex, e.g. "FF 01 01 0F 17 00 00 DA".
 func (p Packet) String() string {
-	parts := make([]string, 0, PacketLen)
-	for _, b := range p {
-		parts = append(parts, fmt.Sprintf("%02X", b))
-	}
-	return strings.Join(parts, " ")
+	return fmt.Sprintf("% X", p[:])
 }
 
 // ParseHex parses a raw packet from hex text. Separators (spaces, commas, colons, "0x" prefixes) are ignored.
-// Seven bytes get the checksum appended; eight bytes are validated. Use ParseHexRaw to skip validation.
+// Seven bytes get the checksum appended; eight bytes must carry a correct one. Both must start with Header. Use
+// ParseHexRaw to skip framing altogether.
 func ParseHex(s string) (Packet, error) {
 	raw, err := ParseHexRaw(s)
 	if err != nil {
@@ -77,6 +74,9 @@ func ParseHex(s string) (Packet, error) {
 	case BodyLen:
 		copy(p[:], raw)
 		p[PacketLen-1] = Checksum(raw)
+		if !p.Valid() {
+			return Packet{}, fmt.Errorf("packet %s does not start with the %02X header", p, Header)
+		}
 	case PacketLen:
 		copy(p[:], raw)
 		if !p.Valid() {

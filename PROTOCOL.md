@@ -101,12 +101,8 @@ but only a heartbeat.** Subscribing to `6e400003` yields a single byte `0x23`
 capture: 14 heartbeats, nothing else. Sending unused command groups (`FF 00 …`,
 `FF 02 …`, `FF 03 …`, `FF 06 …`) produced no distinct reply, only the ongoing
 heartbeat. So there is still no way to read a setting back; the heartbeat is only
-a liveness signal. A real `get` is therefore impossible; `acornvfd get` reports
-the last values it *sent* (from a local state file) plus this heartbeat as an
-"alive" check.
-The device may still send something on the TX characteristic; **[TODO live]**
-`acornvfd listen` (or `get`, which listens for 3 s) and see if anything arrives
-after a write.
+a liveness signal. A real "get" is therefore impossible; there is no command that
+reads a setting back, and `acornvfd listen` only ever shows this heartbeat.
 
 Connection flow used by the app **[verified in code]**: `createBLEConnection`
 → wait ~300 ms → `getBLEDeviceServices` (retries up to 6× if empty) →
@@ -157,7 +153,7 @@ in the prettified `app-service.js`).
 | Set date | `FF 01 00 YY MM DD 00`                | `YY = year - 2000`. App clamps year 2000–2555, month 1–12, day 1–31, but `YY` is masked to one byte so years past 2255 wrap. |
 | Set time | `FF 01 01 hh mm ss 00`                | 24-hour, **local** wall-clock time (app uses `new Date()` getters, no time-zone handling). |
 
-**[verified live 2026-09-07]** `acornvfd set` wrote the date and time and the
+**[verified live 2026-09-07]** `acornvfd time` wrote the date and time and the
 clock's display updated to the correct wall-clock time. The clock plays a short
 **audible beep** when it accepts a command (each write, not an error tone), so a
 normal date+time sync produces one or two beeps.

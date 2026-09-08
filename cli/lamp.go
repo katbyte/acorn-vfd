@@ -129,14 +129,16 @@ moved (--changed colour|brightness); the effect section has no slider.`,
 	return cmd
 }
 
-// lampFlags widens the default --name from the clock to the whole XGGF family when the user did not set one.
+// lampFlags widens the default --name from the clock to the whole XGGF family when the user did not set one, and
+// keeps the lamp out of the remembered-clock state file.
 func lampFlags() (*FlagData, error) {
 	f, err := GetFlags()
 	if err != nil {
 		return nil, err
 	}
-	if f.Device.Name == "XGGF-1V48" && f.Device.Address == "" {
+	if f.Device.Name == DefaultName && f.Device.Address == "" {
 		f.Device.Name = "XGGF-"
 	}
+	f.noRemember = true
 	return f, nil
 }

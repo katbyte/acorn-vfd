@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/katbyte/acornvfd/lib/ble"
@@ -18,27 +17,20 @@ type sender struct {
 	sent int
 }
 
-// withSender connects (unless --dry-run) and runs fn with a sender, then disconnects. It remembers the connected
-// device's address so later runs reconnect without a name (the clock advertises its name only intermittently).
-// Packets are built inside fn so time-based ones are computed after the connection is up, not before a scan.
+// withSender connects (unless --dry-run) and runs fn with a sender, then disconnects. Packets are built inside fn
+// so time-based ones are computed after the connection is up, not before a scan.
 func (f *FlagData) withSender(fn func(s *sender) error) error {
 	s := &sender{f: f}
 
 	if f.Send.DryRun {
 		cout.Printf("<yellow>dry run</>: nothing will be sent\n")
 	} else {
-		conn, err := ble.Connect(f.BLEOptions())
+		conn, err := f.connect()
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if err := conn.Close(); err != nil {
-				cout.Errorf("<yellow>warning:</> %v\n", err)
-			}
-		}()
+		defer closeConn(conn)
 		s.conn = conn
-		cout.Verbosef("<gray>connected to %s (%s)</>\n", nameOr(conn.Found.Name), conn.Found.Address)
-		rememberDevice(f, conn.Found)
 	}
 
 	if err := fn(s); err != nil {
@@ -63,7 +55,7 @@ func (s *sender) Bytes(label string, b []byte) error {
 		time.Sleep(s.f.Send.Gap)
 	}
 
-	cout.Quietf("<white>%-28s</> <cyan>%s</>\n", label, hexBytes(b))
+	cout.Quietf("<white>%-28s</> <cyan>% X</>\n", label, b)
 
 	if !s.f.Send.DryRun {
 		if err := s.conn.Write(b, !s.f.Send.NoResponse); err != nil {
@@ -91,15 +83,59 @@ func (f *FlagData) sendBytes(label string, b []byte) error {
 	return f.withSender(func(s *sender) error { return s.Bytes(label, b) })
 }
 
-// rememberDevice saves the connected device's address so later runs reconnect without a name. Best effort: a
-// failure just means the next run scans by name again.
-func rememberDevice(f *FlagData, found ble.Found) {
-	st, err := state.Load(f.StateFile)
+// open finds the device and connects, discovering services but not resolving characteristics (for dump).
+func (f *FlagData) open() (*ble.Conn, error) {
+	conn, err := ble.Open(f.BLEOptions())
 	if err != nil {
-		return
+		return nil, err
+	}
+	f.connected(conn)
+
+	return conn, nil
+}
+
+// connect opens the device and resolves the write/notify characteristics.
+func (f *FlagData) connect() (*ble.Conn, error) {
+	conn, err := ble.Connect(f.BLEOptions())
+	if err != nil {
+		return nil, err
+	}
+	f.connected(conn)
+
+	return conn, nil
+}
+
+// connected logs the connection and remembers the device's address so later runs reconnect without a name (the
+// clock advertises its name only intermittently). Lamp commands never remember: a bare `acornvfd time` would
+// otherwise reconnect to the lamp.
+func (f *FlagData) connected(conn *ble.Conn) {
+	cout.Verbosef("<gray>connected to %s (%s)</>\n", nameOr(conn.Found.Name), conn.Found.Address)
+	if !f.noRemember {
+		rememberDevice(f.StateFile, conn.Found)
+	}
+}
+
+// closeConn disconnects, warning rather than failing the command when the disconnect itself errors.
+func closeConn(conn *ble.Conn) {
+	if err := conn.Close(); err != nil {
+		cout.Errorf("<yellow>warning:</> %v\n", err)
+	}
+}
+
+// rememberDevice saves the connected device's address. Best effort: a failure just means the next run scans by
+// name again. An unreadable state file is replaced rather than left broken forever.
+func rememberDevice(path string, found ble.Found) {
+	st, err := state.Load(path)
+	if err != nil {
+		cout.Verbosef("<yellow>warning:</> %v; replacing it\n", err)
+		if st, err = state.New(path); err != nil {
+			return
+		}
 	}
 	st.Remember(found.Name, found.Address)
-	_ = st.Save()
+	if err := st.Save(); err != nil {
+		cout.Verbosef("<yellow>warning:</> remembering device: %v\n", err)
+	}
 }
 
 func nameOr(name string) string {
@@ -122,14 +158,6 @@ func lp(p xggf.Packet) labelledPacket {
 		label = fmt.Sprintf("group %02X cmd %02X", p.Group(), p.Cmd())
 	}
 	return labelledPacket{label: label, packet: p}
-}
-
-func hexBytes(b []byte) string {
-	parts := make([]string, 0, len(b))
-	for _, x := range b {
-		parts = append(parts, fmt.Sprintf("%02X", x))
-	}
-	return strings.Join(parts, " ")
 }
 
 func plural(n int) string {

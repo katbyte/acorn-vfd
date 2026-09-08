@@ -89,7 +89,7 @@ desktop distributions).
 |---|---|
 | `scan [--all]` | list nearby XGGF devices (all BLE devices with `--all`) |
 | `dump` | connect and print every GATT service/characteristic, to compare against PROTOCOL.md |
-| `listen [--duration 30s]` | subscribe to the notify characteristic and print anything the device sends |
+| `listen [--duration 30s]` | subscribe to the notify characteristic and print anything the device sends (`--duration 0` = until Ctrl-C) |
 | `time [HH:MM[:SS]]` | no argument syncs date and time from this computer (`--date-only` / `--time-only`); an argument sets just the time |
 | `date [YYYY-MM-DD]` | no argument sets today's date; an argument sets that date |
 | `brightness <0-7\|N%\|auto\|manual>` | manual level (the app's slider maps 0-100 % onto 0-7) or auto-brightness on/off |
