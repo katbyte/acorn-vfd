@@ -1,3 +1,9 @@
+## v0.1.2 (2026-09-08)
+
+- Sign releases: cosign keyless signature on `checksums.txt` (`checksums.txt.sigstore.json`), GitHub build-provenance attestation, and a SLSA provenance job, matching the other katbyte CLIs.
+- Ship more targets: linux 386/arm(v6,v7)/riscv64 and windows/386 alongside the existing amd64/arm64 builds (everything the BLE library can build for).
+- Bring CI and tooling into line with katbyte/tctest verbatim: workflows, golangci-lint config (formatters, full rule set), makefile.
+
 ## v0.1.1 (2026-09-07)
 
 - Fix Homebrew formula publishing so a release updates the `katbyte/homebrew-tap` formula (`brew install katbyte/tap/acornvfd`).
