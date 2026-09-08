@@ -9,7 +9,7 @@
 ![CodeQL](https://github.com/katbyte/acorn-vfd/actions/workflows/codeql-analysis.yml/badge.svg)
 
 <p align="center">
-  <img src=".github/images/clock.png" alt="橡果工坊 XGGF-1V48 round-dial VFD fluorescent clock in a wooden case, cyan analog pointer display" width="340">
+  <img src=".github/images/clock-transparent.png" alt="橡果工坊 XGGF-1V48 round-dial VFD fluorescent clock in a wooden case, cyan analog pointer display" width="340">
 </p>
 
 **Control the 橡果工坊 (Acorn Workshop) IV48 / 1V48 round-dial VFD fluorescent clock over Bluetooth from the
