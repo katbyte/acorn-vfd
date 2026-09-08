@@ -37,4 +37,4 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-        run: ./scripts/update-homebrew-formula.sh
+        run: bash ./scripts/update-homebrew-formula.sh
