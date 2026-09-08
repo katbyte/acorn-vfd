@@ -1,5 +1,12 @@
 # acornvfd
 
+[![GitHub release](https://img.shields.io/github/v/release/katbyte/acorn-vfd?color=blueviolet)](https://github.com/katbyte/acorn-vfd/releases/latest)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/katbyte/acorn-vfd?color=00ADD8)](https://github.com/katbyte/acorn-vfd/blob/main/go.mod)
+[![License](https://img.shields.io/github/license/katbyte/acorn-vfd?color=blue)](https://github.com/katbyte/acorn-vfd/blob/main/LICENSE)
+![build](https://github.com/katbyte/acorn-vfd/actions/workflows/build.yaml/badge.svg)
+![test](https://github.com/katbyte/acorn-vfd/actions/workflows/pr-tests.yaml/badge.svg)
+![lint](https://github.com/katbyte/acorn-vfd/actions/workflows/pr-golangci-lint.yaml/badge.svg)
+
 **Control the 橡果工坊 (Acorn Workshop) IV48 / 1V48 round-dial VFD fluorescent clock over Bluetooth from the
 command line, on macOS, Linux, or Windows, without the WeChat mini-program.**
 
