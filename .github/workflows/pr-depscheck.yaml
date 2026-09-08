@@ -8,10 +8,9 @@ on:
     paths:
       - '.github/**'
       - '**.go'
-      - 'go.mod'
-      - 'go.sum'
       - 'vendor/**'
       - '.tools/**'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
