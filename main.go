@@ -5,9 +5,8 @@ package main
 import (
 	"os"
 
-	"github.com/katbyte/go-kt/clog"
-
 	"github.com/katbyte/acornvfd/cli"
+	"github.com/katbyte/go-kt/clog"
 	"github.com/katbyte/go-kt/cout"
 )
 
