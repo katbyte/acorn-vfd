@@ -1,3 +1,7 @@
+## v0.1.4 (2026-09-13)
+
+- Use the shared [go-kt](https://github.com/katbyte/go-kt) packages for logging, console output and version reporting instead of local copies. The `ACORNVFD_LOG` variable and every command behave as before; colour tags are now rendered from arguments as well as format strings, matching the other tools.
+
 ## v0.1.3 (2026-09-08)
 
 - Fix a data race in scanning: results are now handed to the calling goroutine instead of being touched from the Bluetooth library's callback (which on macOS can still fire after the scan stops).
