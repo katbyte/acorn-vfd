@@ -5,11 +5,16 @@ package main
 import (
 	"os"
 
+	"github.com/katbyte/go-kt/clog"
+
 	"github.com/katbyte/acornvfd/cli"
-	"github.com/katbyte/acornvfd/lib/cout"
+	"github.com/katbyte/go-kt/cout"
 )
 
 func main() {
+	// the log level comes from ACORNVFD_LOG; read it once here, before anything logs
+	clog.SetLevelFromEnv("ACORNVFD_LOG")
+
 	cmd, err := cli.Make()
 	if err != nil {
 		cout.Errorf("<red>acornvfd: building cmd:</> %v\n", err)

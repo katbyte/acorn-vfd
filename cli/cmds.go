@@ -12,9 +12,9 @@ import (
 
 	c "github.com/gookit/color"
 	"github.com/katbyte/acornvfd/lib/ble"
-	"github.com/katbyte/acornvfd/lib/cout"
-	"github.com/katbyte/acornvfd/lib/version"
 	"github.com/katbyte/acornvfd/lib/xggf"
+	"github.com/katbyte/go-kt/cout"
+	"github.com/katbyte/go-kt/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/katbyte/acornvfd/lib/ble"
-	"github.com/katbyte/acornvfd/lib/clog"
-	"github.com/katbyte/acornvfd/lib/cout"
 	"github.com/katbyte/acornvfd/lib/state"
+	"github.com/katbyte/go-kt/clog"
+	"github.com/katbyte/go-kt/cout"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

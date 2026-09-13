@@ -33,8 +33,8 @@ builds:
         goarch: riscv64
     ldflags:
       - -s -w
-      - -X github.com/katbyte/acornvfd/lib/version.Version={{ .Tag }}
-      - -X github.com/katbyte/acornvfd/lib/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/katbyte/go-kt/version.Version={{ .Tag }}
+      - -X github.com/katbyte/go-kt/version.GitCommit={{ .ShortCommit }}
 
   # darwin needs cgo for CoreBluetooth, so this build only works when goreleaser runs on macOS (release.yaml does)
   - id: darwin
@@ -51,8 +51,8 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/katbyte/acornvfd/lib/version.Version={{ .Tag }}
-      - -X github.com/katbyte/acornvfd/lib/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/katbyte/go-kt/version.Version={{ .Tag }}
+      - -X github.com/katbyte/go-kt/version.GitCommit={{ .ShortCommit }}
 
 universal_binaries:
   - ids: [darwin]

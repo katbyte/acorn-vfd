@@ -58,11 +58,11 @@ help: ## Show this help
 ##@ Build
 build: ## Compile acornvfd with version info from git
 	@echo "==> building..."
-	go build -ldflags "-X github.com/katbyte/acornvfd/lib/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/acornvfd/lib/version.Version=${GIT_VERSION}"
+	go build -ldflags "-X github.com/katbyte/go-kt/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/go-kt/version.Version=${GIT_VERSION}"
 
 install: ## Install acornvfd into GOPATH/bin with version info from git
 	@echo "==> installing..."
-	go install -ldflags "-X github.com/katbyte/acornvfd/lib/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/acornvfd/lib/version.Version=${GIT_VERSION}" .
+	go install -ldflags "-X github.com/katbyte/go-kt/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/go-kt/version.Version=${GIT_VERSION}" .
 
 tools: $(ACTIONLINT) $(GOFUMPT) $(GOLANGCI_LINT) $(GOLANGCI_LINT_MODULES) $(SHELLCHECK) $(YAMLLINT) ## Install all pinned dev tools into .tools/bin
 

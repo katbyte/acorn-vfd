@@ -5,9 +5,9 @@ import (
 	"time"
 
 	"github.com/katbyte/acornvfd/lib/ble"
-	"github.com/katbyte/acornvfd/lib/cout"
 	"github.com/katbyte/acornvfd/lib/state"
 	"github.com/katbyte/acornvfd/lib/xggf"
+	"github.com/katbyte/go-kt/cout"
 )
 
 // sender writes labelled packets to a device, or only prints them in dry-run mode.
