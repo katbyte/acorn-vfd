@@ -17,8 +17,10 @@ GOLANGCI_LINT=$(TOOLS_BIN)/golangci-lint
 # yamllint is python installed into a repo-local venv. both rebuild when this makefile changes.
 SHELLCHECK_VERSION=v0.11.0
 YAMLLINT_VERSION=1.38.0
+ZIZMOR_VERSION=v1.30.1
 SHELLCHECK=$(TOOLS_BIN)/shellcheck
 YAMLLINT=$(TOOLS_BIN)/yamllint
+ZIZMOR=$(TOOLS_BIN)/zizmor
 
 # golangci-lint with the azproviderlint module plugin compiled in (.tools/.custom-gcl.yml);
 # lint runs use this binary, the plain go.mod one exists to bootstrap `golangci-lint custom`
@@ -48,6 +50,14 @@ $(YAMLLINT): makefile
 	@mkdir -p $(TOOLS_BIN)
 	@python3 -m venv .tools/venv && .tools/venv/bin/pip install -q yamllint==$(YAMLLINT_VERSION) && ln -sf ../venv/bin/yamllint $@
 
+$(ZIZMOR): makefile
+	@echo "==> downloading zizmor $(ZIZMOR_VERSION)..."
+	@mkdir -p $(TOOLS_BIN)
+	@case "$$(uname)" in Darwin) target=apple-darwin;; *) target=unknown-linux-gnu;; esac; \
+		arch=$$(uname -m); [ "$$arch" = "arm64" ] && arch=aarch64; \
+		curl -sSfL "https://github.com/zizmorcore/zizmor/releases/download/$(ZIZMOR_VERSION)/zizmor-$$arch-$$target.tar.gz" \
+		| tar -xz -O zizmor > $@ && chmod +x $@
+
 default: fmt build
 
 all: fmt build
@@ -64,7 +74,7 @@ install: ## Install acornvfd into GOPATH/bin with version info from git
 	@echo "==> installing..."
 	go install -ldflags "-X github.com/katbyte/go-kt/version.GitCommit=${GIT_COMMIT} -X github.com/katbyte/go-kt/version.Version=${GIT_VERSION}" .
 
-tools: $(ACTIONLINT) $(GOFUMPT) $(GOLANGCI_LINT) $(GOLANGCI_LINT_MODULES) $(SHELLCHECK) $(YAMLLINT) ## Install all pinned dev tools into .tools/bin
+tools: $(ACTIONLINT) $(GOFUMPT) $(GOLANGCI_LINT) $(GOLANGCI_LINT_MODULES) $(SHELLCHECK) $(YAMLLINT) $(ZIZMOR) ## Install all pinned dev tools into .tools/bin
 
 ##@ Formatting
 fmt: $(GOFUMPT) $(GOLANGCI_LINT) ## Fix Go formatting (gofmt, gofumpt, goimports)
@@ -100,6 +110,10 @@ shellcheck: $(SHELLCHECK) ## Check shell scripts with shellcheck
 	@echo "==> Checking shell scripts with shellcheck..."
 	@$(SHELLCHECK) scripts/*.sh # tctest also checks .github/images/*.sh; this repo has no scripts there
 
+zizmor: $(ZIZMOR) ## Audit GitHub workflows for security issues with zizmor
+	@echo "==> Auditing workflows with zizmor..."
+	@$(ZIZMOR) .
+
 depscheck: ## Check that go.mod/go.sum and vendor/ are in sync
 	@echo "==> Checking source code with go mod tidy..."
 	@go mod tidy
@@ -125,4 +139,4 @@ test: build ## Run unit tests under the race detector (tctest also runs integrat
 
 check-all: build test lint actionlint yamllint shellcheck depscheck ## Run build + test + all linters + depscheck
 
-.PHONY: default all help fmt goimports build lint lint-fix actionlint yamllint shellcheck depscheck check-all install tools test
+.PHONY: default all help fmt goimports build lint lint-fix actionlint yamllint shellcheck zizmor depscheck check-all install tools test
