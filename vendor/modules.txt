@@ -14,14 +14,14 @@ github.com/go-viper/mapstructure/v2/internal/errors
 github.com/godbus/dbus/v5
 github.com/godbus/dbus/v5/introspect
 github.com/godbus/dbus/v5/prop
-# github.com/gookit/color v1.6.1
+# github.com/gookit/color v1.6.3
 ## explicit; go 1.18
 github.com/gookit/color
 # github.com/inconshreveable/mousetrap v1.1.0
 ## explicit; go 1.18
 github.com/inconshreveable/mousetrap
-# github.com/katbyte/go-kt v0.2.0
-## explicit; go 1.26
+# github.com/katbyte/go-kt v0.9.1
+## explicit; go 1.27.0
 github.com/katbyte/go-kt/clog
 github.com/katbyte/go-kt/cout
 github.com/katbyte/go-kt/version
@@ -126,8 +126,8 @@ go.yaml.in/yaml/v3
 # golang.org/x/exp v0.0.0-20260727155853-b88d891fe743
 ## explicit; go 1.25.0
 golang.org/x/exp/constraints
-# golang.org/x/sys v0.30.0
-## explicit; go 1.18
+# golang.org/x/sys v0.49.0
+## explicit; go 1.26.0
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 # golang.org/x/text v0.28.0
